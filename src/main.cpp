@@ -76,43 +76,119 @@
 #define COL_G 1
 #define COL_R 2
 
+// ---------------------------------------------------------------- BCM layout
+//
+// The panel is strictly 1 bit per channel per LED -- there is no analogue
+// brightness control, as the README's "Coding" section established. Dimming
+// therefore means Binary Code Modulation: instead of shifting+latching+
+// displaying ONE frame per address, each address is split into BCM_BITS
+// sub-passes ("bit planes"), each shifting+latching its own 384-bit stream and
+// then displaying it for a duration proportional to its binary weight
+// (1, 2, 4, 8... cycles). A pixel's brightness is encoded by which planes its
+// bit is set in: lit in every plane gives full brightness; lit only in the
+// most significant plane gives roughly half; unlit in all gives off.
+//
+// BCM_BITS=4 gives 16 levels per channel (4096 colours) and is the starting
+// point: it keeps the DMA buffer growth to about 2x today's size, which seemed
+// the prudent first step to flash and verify given how many hardware surprises
+// this board has produced already. Once TEST_BRIGHTNESS_RAMP and TEST_BREATHE
+// are confirmed working cleanly, this can likely go to 5 or 6 -- see the
+// "Remaining work" section of README.md for the memory/refresh tradeoff at
+// each value before raising it.
+#define BCM_BITS 4
+// Display length of the least-significant bit-plane, in shift-clock cycles.
+//
+// This controls overall brightness, not just the dimming resolution, and it is
+// easy to get badly wrong: the 384+6 cycle shift+latch overhead repeats for
+// EVERY plane (ADDR_BLOCK_CYCLES includes BCM_BITS copies of it), but the
+// panel is only actually lit during the display windows. At BCM_BITS=4 that
+// overhead is 4*390=1560 cycles; a too-small base of 2 gives display windows
+// of only 2+4+8+16=30 cycles, i.e. a 30/1560 = 1.9% duty cycle even at full
+// white -- technically correct dimming, but far too dim to look right.
+//
+// 32 targets roughly a quarter of the panel's time lit at full brightness
+// (480/(1560+480) = 23.5%), a deliberate compromise against the pre-BCM
+// design's ~50% duty: matching that exactly would need base=104, taking the
+// DMA buffer to ~200KB, which risks not finding one contiguous block of the
+// ESP32's internal DMA-capable RAM. Raise this for more brightness at the cost
+// of memory (linear in BCM_BASE_CYCLES); see the table in README.md.
+#define BCM_BASE_CYCLES 32
+static_assert(BCM_BITS >= 1 && BCM_BITS <= 8, "BCM_BITS must fit an 8-bit channel");
+static_assert(BCM_BASE_CYCLES >= 1, "a plane needs at least one display cycle");
+
 // ---------------------------------------------------------------- DMA layout
 //
 // Each shift cycle expands to CLK low, low, high, high; non-shift cycles keep CLK low.
 #define SHIFT_CYCLES 384
 // Keep CLK low before, during and after LAT; the pulse lasts 1 us at the default rate.
 #define LATCH_CYCLES 6
-#define DISPLAY_CYCLES 384
-#define CYCLES_PER_ADDR (SHIFT_CYCLES + LATCH_CYCLES + DISPLAY_CYCLES)
-#define DMA_WORDS (ADDR_COUNT * CYCLES_PER_ADDR)
 #define SAMPLES_PER_CYCLE 4
+
+// Sum of 2^0 .. 2^(BCM_BITS-1), i.e. the total display cycles for one address
+// if every plane fired consecutively.
+#define BCM_WEIGHT_SUM ((1u << BCM_BITS) - 1)
+// One address now costs BCM_BITS complete shift+latch passes, plus the sum of
+// every plane's weighted display window.
+#define ADDR_BLOCK_CYCLES \
+  (BCM_BITS * (SHIFT_CYCLES + LATCH_CYCLES) + BCM_BASE_CYCLES * BCM_WEIGHT_SUM)
+#define DMA_WORDS (ADDR_COUNT * ADDR_BLOCK_CYCLES)
 #define WAVEFORM_SAMPLES (DMA_WORDS * SAMPLES_PER_CYCLE)
 
-static uint16_t *dma = NULL;  // [addr][cycle], flattened
+static uint16_t *dma = NULL;  // [addr][plane][cycle], flattened
 static uint32_t *dmaWaveform = NULL;
 
-static inline uint16_t *cell(uint8_t addr, int cycleIdx) {
-  return &dma[addr * CYCLES_PER_ADDR + cycleIdx];
+// Offset, in cycles, of each plane's block within one address's span. Computed
+// once at startup since BCM_BASE_CYCLES << p is cheap but not worth repeating
+// on every cell() call.
+static int planeStart[BCM_BITS];
+
+static void computePlaneLayout() {
+  int offset = 0;
+  for (int p = 0; p < BCM_BITS; ++p) {
+    planeStart[p] = offset;
+    offset += SHIFT_CYCLES + LATCH_CYCLES + (BCM_BASE_CYCLES << p);
+  }
+  if (offset != ADDR_BLOCK_CYCLES) {
+    Serial.printf("FATAL: plane layout mismatch (%d != %d)\n", offset,
+                  (int)ADDR_BLOCK_CYCLES);
+    while (true) {
+      delay(1000);
+    }
+  }
 }
 
-// Write the control signals for every cycle. Called once; the data bits are
-// layered on top afterwards and never disturb these.
+static inline uint16_t *cell(uint8_t addr, uint8_t plane, int cycleIdx) {
+  return &dma[addr * ADDR_BLOCK_CYCLES + planeStart[plane] + cycleIdx];
+}
+
+// Write the control signals for every cycle of every plane. Called once; the
+// data bits are layered on top afterwards and never disturb these.
 static void buildControl() {
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    for (int c = 0; c < CYCLES_PER_ADDR; ++c) {
-      // Match bit-bang: select the next address only after shifting while blanked.
-      const uint8_t address = c < SHIFT_CYCLES ? (a + ADDR_COUNT - 1) % ADDR_COUNT : a;
-      uint16_t addrBits = 0;
-      if (address & 0x01) addrBits |= BUS_A0;
-      if (address & 0x02) addrBits |= BUS_A1;
-      uint16_t v = addrBits;
-      if (c < SHIFT_CYCLES + LATCH_CYCLES || c == CYCLES_PER_ADDR - 1) {
-        v |= BUS_OE;
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      const int displayCycles = BCM_BASE_CYCLES << p;
+      const int blockCycles = SHIFT_CYCLES + LATCH_CYCLES + displayCycles;
+      // Address lines only actually move at the first plane of each address;
+      // every later plane of the same address is not a real address
+      // transition, so it just holds steady at `a` throughout, matching how
+      // the original bit-bang driver only touched A0/A1 once per address.
+      const uint8_t shiftAddr = (p == 0) ? (a + ADDR_COUNT - 1) % ADDR_COUNT : a;
+      for (int cc = 0; cc < blockCycles; ++cc) {
+        const uint8_t address = (cc < SHIFT_CYCLES) ? shiftAddr : a;
+        uint16_t addrBits = 0;
+        if (address & 0x01) addrBits |= BUS_A0;
+        if (address & 0x02) addrBits |= BUS_A1;
+        uint16_t v = addrBits;
+        // Blanked for the whole shift + latch window, plus one extra cycle at
+        // the very end of the block for margin at the sub-block boundary.
+        if (cc < SHIFT_CYCLES + LATCH_CYCLES || cc == blockCycles - 1) {
+          v |= BUS_OE;
+        }
+        if (cc == SHIFT_CYCLES + 1 || cc == SHIFT_CYCLES + 2) {
+          v |= BUS_LAT;
+        }
+        *cell(a, p, cc) = v;
       }
-      if (c == SHIFT_CYCLES + 1 || c == SHIFT_CYCLES + 2) {
-        v |= BUS_LAT;
-      }
-      *cell(a, c) = v;
     }
   }
 }
@@ -129,7 +205,21 @@ static_assert(duplicateSample(BUS_CLK) == 0x00400040,
 static void buildDmaWaveform() {
   for (int i = 0; i < DMA_WORDS; ++i) {
     const uint16_t low = dma[i];
-    const uint16_t high = low | ((i % CYCLES_PER_ADDR < SHIFT_CYCLES) ? BUS_CLK : 0);
+    // Every plane's own SHIFT_CYCLES span starts at that plane's planeStart[p],
+    // so "is this cycle inside some plane's shift window" is just: its offset
+    // from the start of whichever plane it falls in must be < SHIFT_CYCLES.
+    // Since planes are laid out back to back, (i % ADDR_BLOCK_CYCLES) modulo
+    // each plane's own block length gives that offset; simplest to recompute
+    // it the same way buildControl did, rather than re-deriving which plane.
+    const int cycleInAddr = i % ADDR_BLOCK_CYCLES;
+    bool inShift = false;
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      if (cycleInAddr >= planeStart[p] && cycleInAddr < planeStart[p] + SHIFT_CYCLES) {
+        inShift = true;
+        break;
+      }
+    }
+    const uint16_t high = low | (inShift ? BUS_CLK : 0);
     // Identical halfwords make I2S sample-pair ordering irrelevant.
     dmaWaveform[2 * i] = duplicateSample(low);
     dmaWaveform[2 * i + 1] = duplicateSample(high);
@@ -139,46 +229,54 @@ static void buildDmaWaveform() {
 static bool validateDmaWaveform() {
   uint16_t previous = BUS_OE;
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    unsigned shifted = 0;
-    unsigned latches = 0;
-    for (int s = 0; s < CYCLES_PER_ADDR * SAMPLES_PER_CYCLE; ++s) {
-      const int index = a * CYCLES_PER_ADDR * SAMPLES_PER_CYCLE + s;
-      const uint32_t pair = dmaWaveform[index / 2];
-      if ((uint16_t)pair != (uint16_t)(pair >> 16)) return false;
-      const uint16_t value = (uint16_t)pair;
-      if ((value & BUS_CLK) && !(previous & BUS_CLK)) {
-        if (!(value & BUS_OE) || (value & BUS_LAT) || shifted >= SHIFT_CYCLES) return false;
-        const uint16_t expected = *cell(a, shifted++) & (BUS_D1 | BUS_D2);
-        if ((value & (BUS_D1 | BUS_D2)) != expected) return false;
-        if ((previous ^ value) & (BUS_D1 | BUS_D2)) return false;
-      }
-      if (value & BUS_LAT) {
-        if ((value & BUS_CLK) || !(value & BUS_OE)) return false;
-        if (!(previous & BUS_LAT)) {
-          if (previous & BUS_CLK) return false;
-          if (shifted != SHIFT_CYCLES) return false;
-          ++latches;
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      const int displayCycles = BCM_BASE_CYCLES << p;
+      const int blockCycles = SHIFT_CYCLES + LATCH_CYCLES + displayCycles;
+      unsigned shifted = 0;
+      unsigned latches = 0;
+      for (int localCycle = 0; localCycle < blockCycles; ++localCycle) {
+        const int globalCycle = a * ADDR_BLOCK_CYCLES + planeStart[p] + localCycle;
+        for (int s = 0; s < SAMPLES_PER_CYCLE; ++s) {
+          const int index = globalCycle * SAMPLES_PER_CYCLE + s;
+          const uint32_t pair = dmaWaveform[index / 2];
+          if ((uint16_t)pair != (uint16_t)(pair >> 16)) return false;
+          const uint16_t value = (uint16_t)pair;
+          if ((value & BUS_CLK) && !(previous & BUS_CLK)) {
+            if (!(value & BUS_OE) || (value & BUS_LAT) || shifted >= SHIFT_CYCLES) return false;
+            const uint16_t expected = *cell(a, p, shifted++) & (BUS_D1 | BUS_D2);
+            if ((value & (BUS_D1 | BUS_D2)) != expected) return false;
+            if ((previous ^ value) & (BUS_D1 | BUS_D2)) return false;
+          }
+          if (value & BUS_LAT) {
+            if ((value & BUS_CLK) || !(value & BUS_OE)) return false;
+            if (!(previous & BUS_LAT)) {
+              if (previous & BUS_CLK) return false;
+              if (shifted != SHIFT_CYCLES) return false;
+              ++latches;
+            }
+          }
+          if (!(value & BUS_OE) || (value & BUS_LAT)) {
+            const unsigned address = ((value & BUS_A0) ? 1 : 0) | ((value & BUS_A1) ? 2 : 0);
+            if (address != a || latches != 1 || (value & BUS_CLK)) return false;
+          }
+          previous = value;
         }
       }
-      if (!(value & BUS_OE) || (value & BUS_LAT)) {
-        const unsigned address = ((value & BUS_A0) ? 1 : 0) | ((value & BUS_A1) ? 2 : 0);
-        if (address != a || latches != 1 || (value & BUS_CLK)) return false;
-      }
-      previous = value;
+      if (shifted != SHIFT_CYCLES || latches != 1) return false;
     }
-    if (shifted != SHIFT_CYCLES || latches != 1) return false;
   }
   return true;
 }
 
 // ------------------------------------------------------------ frame buffer
 
-// Set one bit of the shifted stream. Byte i of the 48-byte stream goes out MSB
-// first, so stream byte i bit b occupies cycle i * 8 + (7 - b).
-static inline void setStreamBit(uint8_t addr, uint8_t bank, uint8_t byteIdx,
-                                uint8_t bitInByte, bool on) {
+// Set one bit of the shifted stream, for one plane. Byte i of the 48-byte
+// stream goes out MSB first, so stream byte i bit b occupies cycle
+// i * 8 + (7 - b), identically within every plane's own shift window.
+static inline void setStreamBit(uint8_t addr, uint8_t plane, uint8_t bank,
+                                uint8_t byteIdx, uint8_t bitInByte, bool on) {
   uint16_t mask = (bank == BANK_TOP) ? BUS_D1 : BUS_D2;
-  uint16_t *c = cell(addr, byteIdx * 8 + (7 - bitInByte));
+  uint16_t *c = cell(addr, plane, byteIdx * 8 + (7 - bitInByte));
   if (on) {
     *c |= mask;
   } else {
@@ -188,23 +286,34 @@ static inline void setStreamBit(uint8_t addr, uint8_t bank, uint8_t byteIdx,
 
 // Write one 16-bit chip word: group 0-7, colour COL_B / COL_G / COL_R. The high
 // byte is sent first, matching how the bit-banged driver packed p[0] and p[1].
+//
+// This is the diagnostic/raw primitive used by the geometry test patterns
+// below: it sets the SAME bit identically across every BCM plane, which is
+// exactly "full brightness" or "off" and so reproduces their pre-BCM behaviour
+// unchanged.
 static void setWord(uint8_t addr, uint8_t bank, uint8_t group, uint8_t colour,
                     uint16_t bits) {
   for (uint8_t b = 0; b < 16; ++b) {
     uint8_t byteIdx = group * 6 + colour * 2 + ((b >= 8) ? 0 : 1);
-    setStreamBit(addr, bank, byteIdx, b & 7, (bits >> b) & 0x01);
+    bool on = (bits >> b) & 0x01;
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      setStreamBit(addr, p, bank, byteIdx, b & 7, on);
+    }
   }
 }
 
 static void clearAll() {
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    for (int c = 0; c < SHIFT_CYCLES; ++c) {
-      *cell(a, c) &= (uint16_t)~(BUS_D1 | BUS_D2);
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      for (int c = 0; c < SHIFT_CYCLES; ++c) {
+        *cell(a, p, c) &= (uint16_t)~(BUS_D1 | BUS_D2);
+      }
     }
   }
 }
 
-// Set or clear one LED. Every step of this mapping is confirmed on hardware:
+// Shared geometry math for both setPixel (below) and setPixelBrightness.
+// Every step of this mapping is confirmed on hardware:
 //
 //   bank      = y / 8           D1 drives rows 0-7, D2 drives rows 8-15
 //   rowInBank = y % 8
@@ -212,11 +321,14 @@ static void clearAll() {
 //   byte      low byte -> the higher row, high byte -> the lower row
 //   group     = x / 8           group 0 is leftmost
 //   bit       = 7 - (x % 8)     higher bits sit further left
-static void setPixel(uint8_t x, uint8_t y, bool r, bool g, bool b) {
-  if (x >= PANEL_WIDTH || y >= PANEL_HEIGHT) {
-    return;
-  }
+struct PixelSlot {
+  uint8_t addr, bank, group, halfIdx, bitInByte;
+};
 
+static inline bool pixelSlot(uint8_t x, uint8_t y, PixelSlot *out) {
+  if (x >= PANEL_WIDTH || y >= PANEL_HEIGHT) {
+    return false;
+  }
   uint8_t bank = y / 8;
   uint8_t rowInBank = y % 8;
   uint8_t addr = rowInBank % ADDR_ROW_STRIDE;
@@ -228,12 +340,47 @@ static void setPixel(uint8_t x, uint8_t y, bool r, bool g, bool b) {
     bit += 8;
   }
 
-  uint8_t halfIdx = (bit >= 8) ? 0 : 1;  // 0 = high byte, sent first
-  uint8_t bitInByte = bit & 7;
+  out->addr = addr;
+  out->bank = bank;
+  out->group = group;
+  out->halfIdx = (bit >= 8) ? 0 : 1;  // 0 = high byte, sent first
+  out->bitInByte = bit & 7;
+  return true;
+}
 
+// Set or clear one LED at full brightness (every plane identical), for the
+// diagnostic test patterns that only ever need solid on/off.
+static void setPixel(uint8_t x, uint8_t y, bool r, bool g, bool b) {
+  PixelSlot s;
+  if (!pixelSlot(x, y, &s)) {
+    return;
+  }
   const bool on[3] = {b, g, r};  // COL_B, COL_G, COL_R
   for (uint8_t c = 0; c < 3; ++c) {
-    setStreamBit(addr, bank, group * 6 + c * 2 + halfIdx, bitInByte, on[c]);
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      setStreamBit(s.addr, p, s.bank, s.group * 6 + c * 2 + s.halfIdx, s.bitInByte, on[c]);
+    }
+  }
+}
+
+// Real per-pixel dimming. r/g/b are 0-255; only the top BCM_BITS bits of each
+// are used, since that is all the hardware currently has bit planes for --
+// e.g. at BCM_BITS=4, values 0x00-0x0F and 0x10-0x1F both render identically.
+static void setPixelBrightness(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b) {
+  PixelSlot s;
+  if (!pixelSlot(x, y, &s)) {
+    return;
+  }
+  const uint8_t reduced[3] = {
+      (uint8_t)(b >> (8 - BCM_BITS)),
+      (uint8_t)(g >> (8 - BCM_BITS)),
+      (uint8_t)(r >> (8 - BCM_BITS)),
+  };  // COL_B, COL_G, COL_R
+  for (uint8_t c = 0; c < 3; ++c) {
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      bool on = (reduced[c] >> p) & 0x01;
+      setStreamBit(s.addr, p, s.bank, s.group * 6 + c * 2 + s.halfIdx, s.bitInByte, on);
+    }
   }
 }
 
@@ -250,6 +397,8 @@ static void fillAddr(uint8_t addr, uint8_t bank, bool b, bool g, bool r) {
 enum TestMode {
   TEST_CYCLE_RULER, // raw DMA cycles, to measure the cycle -> column ratio
   TEST_GEOMETRY,    // border, diagonal and corner markers
+  TEST_BRIGHTNESS_RAMP, // real BCM dimming: a left-to-right brightness gradient
+  TEST_BREATHE,     // real BCM dimming: one block fading continuously over time
   TEST_ALL_ON,      // everything white
   TEST_ADDR_ID,     // one distinct colour per address and bank
   TEST_GROUP_MARK,  // bit 0 of all 8 groups at once
@@ -274,14 +423,17 @@ static const uint32_t MODE_MS = 6000;
 // white; at step 1, 16 columns; and so on to the full width at step 7.
 //
 // Each block now generates exactly 48 rising edges in the encoded waveform.
+// Lit on every plane, so it is full brightness like before BCM existed.
 static void patternCycleRuler(uint32_t step) {
   int groups = (int)(step % GROUPS_PER_STREAM) + 1;
   int upto = groups * 48;
   if (upto > SHIFT_CYCLES) {
     upto = SHIFT_CYCLES;
   }
-  for (int c = 0; c < upto; ++c) {
-    *cell(0, c) |= (uint16_t)(BUS_D1 | BUS_D2);
+  for (uint8_t p = 0; p < BCM_BITS; ++p) {
+    for (int c = 0; c < upto; ++c) {
+      *cell(0, p, c) |= (uint16_t)(BUS_D1 | BUS_D2);
+    }
   }
 }
 
@@ -309,6 +461,37 @@ static void patternGeometry() {
   }
   // A single blue pixel just inside the bottom right corner.
   setPixel(PANEL_WIDTH - 2, PANEL_HEIGHT - 2, false, false, true);
+}
+
+// Horizontal brightness ramp: proves intermediate BCM levels are actually
+// distinguishable (not just banded into on/off) and that the panel does not
+// flicker or ghost at partial brightness. Left = dim, right = full, in four
+// row-bands of red / green / blue / white so every channel is exercised.
+static void patternBrightnessRamp() {
+  for (uint8_t x = 0; x < PANEL_WIDTH; ++x) {
+    uint8_t level = (uint8_t)((uint16_t)x * 255 / (PANEL_WIDTH - 1));
+    for (uint8_t y = 0; y < PANEL_HEIGHT; ++y) {
+      uint8_t band = y / 4;  // four 4-row bands
+      uint8_t r = (band == 0 || band == 3) ? level : 0;
+      uint8_t g = (band == 1 || band == 3) ? level : 0;
+      uint8_t bch = (band == 2 || band == 3) ? level : 0;
+      setPixelBrightness(x, y, r, g, bch);
+    }
+  }
+}
+
+// A filled block whose brightness breathes continuously, to show the dimming
+// is really live PWM varying in real time, not a fixed static level baked in
+// at draw time. Triangle wave, 0 -> 255 -> 0 over 3 seconds.
+static void patternBreathe() {
+  uint32_t t = millis() % 3000;
+  uint32_t half = (t < 1500) ? t : (3000 - t);
+  uint8_t level = (uint8_t)(half * 255 / 1500);
+  for (uint8_t y = 4; y < 12; ++y) {
+    for (uint8_t x = 16; x < 48; ++x) {
+      setPixelBrightness(x, y, level, level, level);
+    }
+  }
 }
 
 // Every LED of every colour, both banks, all four addresses.
@@ -356,15 +539,17 @@ static void patternBitWalk(uint32_t step) {
 
 static const char *modeName(TestMode m) {
   switch (m) {
-    case TEST_CYCLE_RULER:return "CYCLE_RULER- raw DMA cycles, measures the ratio";
-    case TEST_GEOMETRY:   return "GEOMETRY   - border, diagonal, corner markers";
-    case TEST_ALL_ON:     return "ALL_ON     - every LED white";
-    case TEST_ADDR_ID:    return "ADDR_ID    - 8 bands, all different colours";
-    case TEST_GROUP_MARK: return "GROUP_MARK - bit 0 of all 8 groups at once";
-    case TEST_LOW_BYTE:   return "LOW_BYTE   - bits 0-7 of all 8 groups at once";
-    case TEST_WORD_WALK:  return "WORD_WALK  - one 16-bit chip word at a time";
-    case TEST_BIT_WALK:   return "BIT_WALK   - one single LED at a time";
-    default:              return "?";
+    case TEST_CYCLE_RULER:     return "CYCLE_RULER- raw DMA cycles, measures the ratio";
+    case TEST_GEOMETRY:        return "GEOMETRY   - border, diagonal, corner markers";
+    case TEST_BRIGHTNESS_RAMP: return "BRIGHT_RAMP- BCM dimming: left-right gradient";
+    case TEST_BREATHE:         return "BREATHE    - BCM dimming: live fading block";
+    case TEST_ALL_ON:          return "ALL_ON     - every LED white";
+    case TEST_ADDR_ID:         return "ADDR_ID    - 8 bands, all different colours";
+    case TEST_GROUP_MARK:      return "GROUP_MARK - bit 0 of all 8 groups at once";
+    case TEST_LOW_BYTE:        return "LOW_BYTE   - bits 0-7 of all 8 groups at once";
+    case TEST_WORD_WALK:       return "WORD_WALK  - one 16-bit chip word at a time";
+    case TEST_BIT_WALK:        return "BIT_WALK   - one single LED at a time";
+    default:                   return "?";
   }
 }
 
@@ -384,14 +569,16 @@ static void reportStep(uint32_t step) {
 static void drawCurrent(uint32_t step) {
   clearAll();
   switch (mode) {
-    case TEST_CYCLE_RULER:patternCycleRuler(step); break;
-    case TEST_GEOMETRY:   patternGeometry();     break;
-    case TEST_ALL_ON:     patternAllOn();        break;
-    case TEST_ADDR_ID:    patternAddrId();       break;
-    case TEST_GROUP_MARK: patternGroupMark();    break;
-    case TEST_LOW_BYTE:   patternLowByte();      break;
-    case TEST_WORD_WALK:  patternWordWalk(step); break;
-    case TEST_BIT_WALK:   patternBitWalk(step);  break;
+    case TEST_CYCLE_RULER:     patternCycleRuler(step);    break;
+    case TEST_GEOMETRY:        patternGeometry();          break;
+    case TEST_BRIGHTNESS_RAMP: patternBrightnessRamp();    break;
+    case TEST_BREATHE:         patternBreathe();           break;
+    case TEST_ALL_ON:          patternAllOn();             break;
+    case TEST_ADDR_ID:         patternAddrId();            break;
+    case TEST_GROUP_MARK:      patternGroupMark();         break;
+    case TEST_LOW_BYTE:        patternLowByte();           break;
+    case TEST_WORD_WALK:       patternWordWalk(step);      break;
+    case TEST_BIT_WALK:        patternBitWalk(step);       break;
     default: break;
   }
   buildDmaWaveform();
@@ -422,33 +609,38 @@ static void releasePinsToGpio() {
 // This deliberately mirrors the original bit-banged driver in
 // reference/bitbang_reference.cpp, which is known to work on this panel: it uses
 // digitalWrite for its ~100ns of data setup time, latches with no clock running,
-// and holds the display with a plain delay rather than clocking through it.
+// and holds the display with a delay rather than clocking through it. The delay
+// is now repeated once per BCM plane, scaled by that plane's binary weight --
+// this is a coarse approximation (not cycle-accurate like the DMA path) since
+// bit-bang is a diagnostic fallback, not a performance target.
 //
 // Only the source of the data differs -- the bits come from the shift cycles of
-// the DMA buffer. So if the picture is right here, the buffer layout and pixel
-// mapping are both good and the fault is in the I2S peripheral.
+// the DMA buffer. So if a picture is right here, the buffer layout and pixel
+// mapping are both good and any fault lies in the I2S peripheral instead.
 static void bitbangRefresh() {
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    digitalWrite(PIN_OE, HIGH);
+    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+      digitalWrite(PIN_OE, HIGH);
 
-    for (int c = 0; c < SHIFT_CYCLES; ++c) {
-      uint16_t v = *cell(a, c);
-      digitalWrite(PIN_D1, (v & BUS_D1) ? HIGH : LOW);
-      digitalWrite(PIN_D2, (v & BUS_D2) ? HIGH : LOW);
-      digitalWrite(PIN_CLK, HIGH);
-      digitalWrite(PIN_CLK, LOW);
+      for (int c = 0; c < SHIFT_CYCLES; ++c) {
+        uint16_t v = *cell(a, p, c);
+        digitalWrite(PIN_D1, (v & BUS_D1) ? HIGH : LOW);
+        digitalWrite(PIN_D2, (v & BUS_D2) ? HIGH : LOW);
+        digitalWrite(PIN_CLK, HIGH);
+        digitalWrite(PIN_CLK, LOW);
+      }
+
+      digitalWrite(PIN_A0, a & 0x01);
+      digitalWrite(PIN_A1, (a >> 1) & 0x01);
+
+      digitalWrite(PIN_LAT, HIGH);
+      delayMicroseconds(1);
+      digitalWrite(PIN_LAT, LOW);
+
+      digitalWrite(PIN_OE, LOW);
+      delayMicroseconds(20u << p);
+      digitalWrite(PIN_OE, HIGH);
     }
-
-    digitalWrite(PIN_A0, a & 0x01);
-    digitalWrite(PIN_A1, (a >> 1) & 0x01);
-
-    digitalWrite(PIN_LAT, HIGH);
-    delayMicroseconds(1);
-    digitalWrite(PIN_LAT, LOW);
-
-    digitalWrite(PIN_OE, LOW);
-    delayMicroseconds(500);
-    digitalWrite(PIN_OE, HIGH);
   }
 }
 
@@ -477,10 +669,15 @@ static bool startI2S() {
 void setup() {
   Serial.begin(115200);
   Serial.println();
-  Serial.println("LED Tile v2 driver - I2S parallel DMA [encoded CLK / paired samples]");
+  Serial.println("LED Tile v2 driver - I2S parallel DMA [encoded CLK / BCM dimming]");
   // If this number climbs on its own, the sketch is crash-looping rather than
   // sitting still, and the DMA is simply replaying its last buffer.
   Serial.printf("boot #%u\n", (unsigned)++bootCount);
+  Serial.printf("BCM: %u bits (%u levels/channel), base %u cycles\n",
+                (unsigned)BCM_BITS, (unsigned)(1u << BCM_BITS),
+                (unsigned)BCM_BASE_CYCLES);
+
+  computePlaneLayout();
 
   dma = (uint16_t *)heap_caps_malloc(DMA_WORDS * sizeof(uint16_t),
                                      MALLOC_CAP_DMA);
@@ -502,7 +699,7 @@ void setup() {
     Serial.println("FATAL: invalid DMA clock/latch waveform");
     while (true) delay(1000);
   }
-  Serial.println("waveform check: OK (384 rising clocks and one clock-low latch per address)");
+  Serial.println("waveform check: OK (384 rising clocks and one clock-low latch per plane)");
 
   if (!startI2S()) {
     Serial.println("FATAL: I2S parallel setup failed");
@@ -630,6 +827,15 @@ void loop() {
       redraw = true;
       reportStep(step);
     }
+  }
+
+  // BREATHE animates continuously from millis(), independent of the step/mode
+  // timers above, so force a redraw every ~30ms while it is on screen -- that
+  // is what proves the dimming is live PWM rather than a fixed static level.
+  static uint32_t lastBreatheDraw = 0;
+  if (mode == TEST_BREATHE && millis() - lastBreatheDraw > 30) {
+    lastBreatheDraw = millis();
+    redraw = true;
   }
 
   // The DMA chain plays continuously, so drawing only has to happen when the

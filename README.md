@@ -204,38 +204,110 @@ bit       = 7 - (x % 8)     higher bits sit further left
 This is implemented as `setPixel(x, y, r, g, b)` in [src/main.cpp](src/main.cpp), and the
 `GEOMETRY` test pattern draws a border, a diagonal and corner markers to prove it.
 
-### I2S parallel DMA
+### I2S parallel DMA, with an encoded clock
 
-The driver no longer bit-bangs. All six control signals ride on the I2S bus alongside
-the data, and the pixel clock comes from the I2S word-select line, so latch and
-blanking are timed by the DMA stream rather than by CPU writes.
+The driver no longer bit-bangs by default. All seven signals -- `D1`, `D2`, `LAT`,
+`OE`, `A0`, `A1` and now **`CLK` itself** -- ride as plain data bits inside the I2S
+DMA stream, rather than `CLK` coming from the I2S word-select line.
 
-The DMA buffer holds one 16-bit word per clock cycle. Each address gets a block of:
+That last point was a real bring-up lesson, not a stylistic choice: an earlier
+version used WS as the hardware-generated pixel clock, and it stalled after exactly
+one DMA descriptor (confirmed on hardware via `out_link_dscr` freezing and a latched
+`TX_REMPTY`). Generating `CLK` in software by oversampling -- each logical shift
+cycle expands to four raw I2S samples encoding "low, low, high, high" -- removed the
+dependency on that WS/BCK timing path entirely and has been stable since. The
+tradeoff is a 4x sample-rate cost (`SAMPLES_PER_CYCLE` in
+[src/main.cpp](src/main.cpp)), which the ESP32's DMA throughput comfortably absorbs
+at these panel sizes.
 
-| Cycles      | LAT  | OE        | What happens                       |
-|-------------|------|-----------|------------------------------------|
-| 0 - 383     | low  | high      | 384 data bits shifted in, blanked  |
-| 384         | high | high      | latch pulse                        |
-| 385         | low  | high      | latch released                     |
-| 386 - 769   | low  | **low**   | display window, row lit            |
-
-At a 10 MHz pixel clock that is 3080 cycles per frame, giving roughly a **3.2 kHz
-refresh** with a 50% duty cycle -- far above the flicker threshold, and with ample
-headroom for the bit planes that BCM will need. The bus bit assignments live in
-[src/main.cpp](src/main.cpp) and the peripheral setup in
-[src/i2s_parallel.cpp](src/i2s_parallel.cpp).
+A startup self-check (`validateDmaWaveform()`) walks the entire encoded waveform in
+software before I2S is ever started, confirming exactly 384 rising clock edges and
+one clean latch pulse per bit-plane per address. If a future change to the layout
+introduces an off-by-one, this catches it as a boot-time `FATAL:` message instead of
+a mysteriously wrong picture on the panel.
 
 Because the ESP32 routes I2S through the GPIO matrix, **the wiring does not change**.
-
 The previous bit-banged driver is kept verbatim at
 [reference/bitbang_reference.cpp](reference/bitbang_reference.cpp) as a known-good
-fallback, since this project is not under version control.
+fallback; it is also reachable live at runtime with the `d` serial key, replaying the
+exact same buffer through plain `digitalWrite` instead of DMA -- invaluable for
+telling "the buffer is wrong" apart from "the I2S peripheral is misbehaving".
+
+### BCM dimming
+
+The panel is strictly 1 bit per channel per LED -- no analogue brightness control
+exists at the hardware level, as the "Coding" section above established. Dimming is
+therefore **Binary Code Modulation**: each address is split into `BCM_BITS` complete
+shift+latch+display sub-passes ("bit planes"), each displayed for a duration
+proportional to its binary weight (1, 2, 4, 8... cycles). A pixel's brightness is
+encoded by which planes its bit is set in.
+
+```
+one address, BCM_BITS = 4:
+
+  plane 0  shift 384 bits -> latch -> display  2 cycles   (weight 1)
+  plane 1  shift 384 bits -> latch -> display  4 cycles   (weight 2)
+  plane 2  shift 384 bits -> latch -> display  8 cycles   (weight 4)
+  plane 3  shift 384 bits -> latch -> display 16 cycles   (weight 8)
+```
+
+Address lines only actually move at the first plane of each address (mirroring the
+original bit-bang driver, which touches `A0`/`A1` once per address); later planes of
+the same address hold the address steady, since no real transition is happening.
+
+`BCM_BITS` defaults to **4** (16 levels per channel, 4096 colours), chosen as a
+first, conservative step rather than jumping straight to full 8-bit depth, given how
+many real hardware surprises this board has produced through bring-up already. The
+cost of raising it is real and compounds per bit, since the fixed 390-cycle
+shift+latch overhead repeats for every plane, not just the display window.
+
+**`BCM_BASE_CYCLES`** (the shortest plane's display length, in shift-clock cycles)
+is just as important as `BCM_BITS` and easy to get badly wrong -- an earlier value of
+2 gave technically-correct relative dimming levels, but only a **1.9% duty cycle
+even at full white** (30 display cycles against 1560 cycles of repeated shift
+overhead), which read as "barely lit" rather than dim. The current value of 32
+targets roughly a **quarter of the time lit at full brightness** -- dimmer than the
+pre-BCM design's ~50% duty, but in the same order of magnitude rather than two
+orders of magnitude off:
+
+| `BCM_BITS` | `BASE` | Levels/channel | Max duty | DMA words | Buffer size | Refresh @ 2 MHz |
+|------------|--------|-----------------|----------|-----------|--------------|------------------|
+| -- (pre-BCM baseline) | -- | 2  | ~49.6%  | 3080  | ~54 KB  | ~649 Hz |
+| 2          | 32     | 4               | ~11.0%   | 3504      | ~62 KB       | ~571 Hz          |
+| 3          | 32     | 8               | ~16.1%   | 5576      | ~98 KB       | ~359 Hz          |
+| 4 (current)| 32     | 16              | ~23.5%   | 8160      | ~143 KB      | ~245 Hz          |
+| 5          | 32     | 32              | ~33.7%   | 11768     | ~207 KB      | ~170 Hz          |
+
+(Refresh and duty-cycle figures are computed from the I2S clock divider in
+[src/i2s_parallel.cpp](src/i2s_parallel.cpp) and the layout macros in
+[src/main.cpp](src/main.cpp), not measured -- at the default clock the divider
+reproduces the hardware-confirmed 649 Hz of the pre-BCM, single-plane design
+exactly, which is what makes the derived numbers above trustworthy.) `BCM_BITS` 5
+is the point where the ~184KB `dmaWaveform` buffer starts risking not finding a
+single contiguous block in the ESP32's internal DMA-capable RAM; both buffer
+allocations already fail safely with a `FATAL: could not allocate DMA buffer`
+halt-and-print rather than silent corruption. Raising `BCM_BASE_CYCLES` instead of
+`BCM_BITS` trades the same memory for brightness rather than for more levels --
+useful if 16 levels is enough but the panel still looks dim.
+
+Two new test patterns exercise real dimming rather than solid on/off:
+
+- **`BRIGHTNESS_RAMP`** -- a static left-to-right gradient in four row-bands (red,
+  green, blue, white), to confirm intermediate levels are actually distinguishable
+  and that partial brightness does not flicker or ghost.
+- **`BREATHE`** -- a filled block whose brightness fades continuously on a 3-second
+  triangle wave, proving the dimming is live PWM rather than a fixed level baked in
+  at draw time.
+
+`setPixel(x, y, bool r, g, b)` is unchanged and still drives every plane identically
+(full brightness or off), so every earlier diagnostic pattern keeps working exactly
+as before. The new `setPixelBrightness(x, y, uint8_t r, g, b)` is the real API,
+taking 0-255 per channel and using its top `BCM_BITS` bits.
 
 ### Remaining work
 
-1. **BCM / temporal dithering** for more than 8 colours. The DMA layout is already
-   shaped for it: each bit plane becomes another block per address, with the display
-   window length carrying the plane's binary weight.
+1. **Raise `BCM_BITS`** once `BRIGHTNESS_RAMP` and `BREATHE` are confirmed clean on
+   hardware -- see the memory/refresh table above before picking a value.
 2. **Double buffering**, so drawing never tears against the running DMA chain.
 
 ## References
