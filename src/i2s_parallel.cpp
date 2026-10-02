@@ -24,41 +24,50 @@ static uint32_t sActualHz = 0;
 uint32_t i2sParallelActualHz(void) { return sActualHz; }
 
 bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
-                      uint32_t clockHz, void *buffer, size_t lengthBytes,
-                      bool clockInvert) {
-  if (!busPins || !buffer || lengthBytes == 0 || clockHz == 0 ||
+                      uint32_t clockHz, const I2SSegment *segments,
+                      size_t segmentCount, bool clockInvert) {
+  if (!busPins || !segments || segmentCount == 0 || clockHz == 0 ||
       busWidth == 0 || busWidth > 16) {
     return false;
   }
 
   // ---- descriptor chain, linked back to itself so playback loops forever ----
-  sDescCount = (lengthBytes + MAX_DMA_LEN - 1) / MAX_DMA_LEN;
+  sDescCount = 0;
+  for (size_t i = 0; i < segmentCount; ++i) {
+    if (!segments[i].buf || segments[i].bytes == 0 || (segments[i].bytes & 3)) {
+      return false;
+    }
+    sDescCount += (segments[i].bytes + MAX_DMA_LEN - 1) / MAX_DMA_LEN;
+  }
   sDesc = (lldesc_t *)heap_caps_malloc(sDescCount * sizeof(lldesc_t),
                                        MALLOC_CAP_DMA);
   if (!sDesc) {
     return false;
   }
 
-  // Split evenly rather than filling each descriptor to the brim, so every
-  // chunk stays 4-byte aligned and no runt descriptor ends the chain.
-  size_t chunk = ((lengthBytes / sDescCount) + 3) & ~((size_t)3);
-
-  uint8_t *p = (uint8_t *)buffer;
-  size_t remaining = lengthBytes;
-  for (int i = 0; i < sDescCount; ++i) {
-    size_t n = remaining > chunk ? chunk : remaining;
-    sDesc[i].size = n;
-    sDesc[i].length = n;
-    sDesc[i].buf = p;
-    // EOF on the wrap point only, so out_eof_des_addr and the OUT_EOF flag
-    // report a real lap of the chain rather than staying blank.
-    sDesc[i].eof = (i == sDescCount - 1) ? 1 : 0;
-    sDesc[i].sosf = 0;
-    sDesc[i].owner = 1;
-    sDesc[i].offset = 0;
-    sDesc[i].qe.stqe_next = &sDesc[(i + 1) % sDescCount];
-    p += n;
-    remaining -= n;
+  int d = 0;
+  for (size_t i = 0; i < segmentCount; ++i) {
+    // Split each segment evenly rather than filling descriptors to the brim,
+    // so every chunk stays 4-byte aligned and no runt descriptor ends it.
+    const int pieces = (segments[i].bytes + MAX_DMA_LEN - 1) / MAX_DMA_LEN;
+    const size_t chunk = ((segments[i].bytes / pieces) + 3) & ~((size_t)3);
+    uint8_t *p = (uint8_t *)segments[i].buf;
+    size_t remaining = segments[i].bytes;
+    for (int k = 0; k < pieces; ++k, ++d) {
+      size_t n = remaining > chunk ? chunk : remaining;
+      sDesc[d].size = n;
+      sDesc[d].length = n;
+      sDesc[d].buf = p;
+      // EOF on the wrap point only, so out_eof_des_addr and the OUT_EOF flag
+      // report a real lap of the chain rather than staying blank.
+      sDesc[d].eof = (d == sDescCount - 1) ? 1 : 0;
+      sDesc[d].sosf = 0;
+      sDesc[d].owner = 1;
+      sDesc[d].offset = 0;
+      sDesc[d].qe.stqe_next = &sDesc[(d + 1) % sDescCount];
+      p += n;
+      remaining -= n;
+    }
   }
 
   // Reset as well as enable: begin() is called again whenever the clock or the

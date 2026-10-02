@@ -21,9 +21,18 @@
 // clockInvert selects which clock edge the receiver samples on. The MBI5034
 // shifts on the rising edge; if data lands one bit out, this is the flag to
 // flip first.
+// The playback buffer is given as several segments that are played back to
+// back, then looped. They need not be contiguous with each other, which lets a
+// large waveform be built from several smaller internal-RAM allocations rather
+// than one huge block. Each segment must be DMA-capable and a multiple of 4 bytes.
+typedef struct {
+  void *buf;
+  size_t bytes;
+} I2SSegment;
+
 bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
-                      uint32_t clockHz, void *buffer, size_t lengthBytes,
-                      bool clockInvert);
+                      uint32_t clockHz, const I2SSegment *segments,
+                      size_t segmentCount, bool clockInvert);
 
 // Real pixel clock after integer division, in Hz. Zero until begin() succeeds.
 uint32_t i2sParallelActualHz(void);

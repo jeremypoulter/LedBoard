@@ -99,7 +99,9 @@
 // so the only real fix is more of them. 32 levels halves that top-end gap to
 // ~3.3%. See the table in README.md for memory/refresh at each value before
 // raising further.
-#define BCM_BITS 5
+#ifndef BCM_BITS
+#define BCM_BITS 8
+#endif
 // Display length of the least-significant bit-plane, in shift-clock cycles.
 //
 // This controls overall brightness, not just the dimming resolution, and it is
@@ -118,7 +120,9 @@
 // of resolution, at a small, acceptable cost in max brightness (19.7% -> 17.5%
 // duty). Raise this independently of BCM_BITS for more brightness at the cost
 // of memory (linear in BCM_BASE_CYCLES); see the table in README.md.
-#define BCM_BASE_CYCLES 16
+#ifndef BCM_BASE_CYCLES
+#define BCM_BASE_CYCLES 4
+#endif
 static_assert(BCM_BITS >= 1 && BCM_BITS <= 8, "BCM_BITS must fit an 8-bit channel");
 static_assert(BCM_BASE_CYCLES >= 1, "a plane needs at least one display cycle");
 
@@ -134,7 +138,9 @@ static_assert(BCM_BASE_CYCLES >= 1, "a plane needs at least one display cycle");
 // FLOOR_CYCLES' contribution to ADDR_BLOCK_CYCLES below and the updated
 // table in README.md. Kept at a quarter of BCM_BASE_CYCLES, scaled down
 // alongside it when BCM_BASE_CYCLES halved from 32 to 16.
-#define FLOOR_CYCLES 4
+#ifndef FLOOR_CYCLES
+#define FLOOR_CYCLES 2
+#endif
 #define TOTAL_PLANES (BCM_BITS + 1)
 static_assert(FLOOR_CYCLES >= 1 && FLOOR_CYCLES < BCM_BASE_CYCLES,
               "the floor plane must be dimmer than the smallest main level");
@@ -167,7 +173,16 @@ static constexpr int planeWeight(uint8_t p) {
 #define WAVEFORM_SAMPLES (DMA_WORDS * SAMPLES_PER_CYCLE)
 
 static uint16_t *dma = NULL;  // [addr][plane][cycle], flattened
-static uint32_t *dmaWaveform = NULL;
+// The playback waveform is held as one internal-RAM chunk per address rather
+// than one monolithic block, so it only needs ADDR_COUNT blocks of
+// WAVEFORM_WORDS_PER_ADDR words rather than a single huge contiguous one. The
+// I2S descriptor chain simply plays the chunks back to back.
+#define WAVEFORM_WORDS_PER_ADDR (ADDR_BLOCK_CYCLES * 2)
+static uint32_t *dmaWaveform[ADDR_COUNT];
+
+static inline uint32_t &waveWord(int wordIdx) {
+  return dmaWaveform[wordIdx / WAVEFORM_WORDS_PER_ADDR][wordIdx % WAVEFORM_WORDS_PER_ADDR];
+}
 
 // Offset, in cycles, of each plane's block within one address's span. Computed
 // once at startup since planeWeight() is cheap but not worth repeating on
@@ -253,8 +268,8 @@ static void buildDmaWaveform() {
     }
     const uint16_t high = low | (inShift ? BUS_CLK : 0);
     // Identical halfwords make I2S sample-pair ordering irrelevant.
-    dmaWaveform[2 * i] = duplicateSample(low);
-    dmaWaveform[2 * i + 1] = duplicateSample(high);
+    waveWord(2 * i) = duplicateSample(low);
+    waveWord(2 * i + 1) = duplicateSample(high);
   }
 }
 
@@ -270,7 +285,7 @@ static bool validateDmaWaveform() {
         const int globalCycle = a * ADDR_BLOCK_CYCLES + planeStart[p] + localCycle;
         for (int s = 0; s < SAMPLES_PER_CYCLE; ++s) {
           const int index = globalCycle * SAMPLES_PER_CYCLE + s;
-          const uint32_t pair = dmaWaveform[index / 2];
+          const uint32_t pair = waveWord(index / 2);
           if ((uint16_t)pair != (uint16_t)(pair >> 16)) return false;
           const uint16_t value = (uint16_t)pair;
           if ((value & BUS_CLK) && !(previous & BUS_CLK)) {
@@ -767,8 +782,13 @@ static bool startI2S() {
   }
   const int8_t busPins[BUS_WIDTH] = {PIN_D1, PIN_D2, PIN_LAT,
                                      PIN_OE, PIN_A0, PIN_A1, PIN_CLK};
-  if (!i2sParallelBegin(busPins, BUS_WIDTH, -1, clockHz * SAMPLES_PER_CYCLE, dmaWaveform,
-                        WAVEFORM_SAMPLES * sizeof(uint16_t), false)) {
+  I2SSegment segments[ADDR_COUNT];
+  for (int a = 0; a < ADDR_COUNT; ++a) {
+    segments[a].buf = dmaWaveform[a];
+    segments[a].bytes = WAVEFORM_WORDS_PER_ADDR * sizeof(uint32_t);
+  }
+  if (!i2sParallelBegin(busPins, BUS_WIDTH, -1, clockHz * SAMPLES_PER_CYCLE, segments,
+                        ADDR_COUNT, false)) {
     return false;
   }
   i2sRunning = true;
@@ -798,16 +818,49 @@ void setup() {
   computePlaneLayout();
   buildGammaLUT();
 
-  dma = (uint16_t *)heap_caps_malloc(DMA_WORDS * sizeof(uint16_t),
-                                     MALLOC_CAP_DMA);
-  dmaWaveform = (uint32_t *)heap_caps_malloc(WAVEFORM_SAMPLES * sizeof(uint16_t),
-                                            MALLOC_CAP_DMA);
-  if (!dma || !dmaWaveform) {
+  Serial.printf("heap before alloc: internal free %u, largest block %u, "
+                "DMA-capable largest %u, PSRAM free %u (found: %s)\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                psramFound() ? "yes" : "no");
+
+  // dma[] is only ever touched by the CPU (buildDmaWaveform() expands it into
+  // the waveform chunks, which are what the I2S engine actually reads), so it
+  // does not need to be DMA-capable and can live in PSRAM when that is enabled.
+  dma = (uint16_t *)heap_caps_malloc(DMA_WORDS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+  const bool dmaInPsram = (dma != NULL);
+  if (!dma) {
+    dma = (uint16_t *)heap_caps_malloc(DMA_WORDS * sizeof(uint16_t), MALLOC_CAP_8BIT);
+  }
+  bool waveformOk = (dma != NULL);
+  for (int a = 0; a < ADDR_COUNT && waveformOk; ++a) {
+    dmaWaveform[a] = (uint32_t *)heap_caps_malloc(
+        WAVEFORM_WORDS_PER_ADDR * sizeof(uint32_t), MALLOC_CAP_DMA);
+    if (!dmaWaveform[a]) {
+      Serial.printf("FATAL: waveform chunk %d (%u bytes) failed\n", a,
+                    (unsigned)(WAVEFORM_WORDS_PER_ADDR * sizeof(uint32_t)));
+      waveformOk = false;
+    }
+  }
+  if (!waveformOk) {
     Serial.println("FATAL: could not allocate DMA buffer");
+    Serial.printf("  need %u bytes DMA in %d chunks; DMA free now %u, largest %u\n",
+                  (unsigned)(ADDR_COUNT * WAVEFORM_WORDS_PER_ADDR * sizeof(uint32_t)),
+                  ADDR_COUNT, (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     while (true) {
       delay(1000);
     }
   }
+  Serial.printf("dma[] staging buffer: %u bytes in %s\n",
+                (unsigned)(DMA_WORDS * sizeof(uint16_t)),
+                dmaInPsram ? "PSRAM" : "internal RAM");
+  Serial.printf("heap after alloc: DMA-capable free %u (largest %u) -> "
+                "headroom for further growth\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
   Serial.printf("DMA waveform: %u samples (%u bytes)\n", (unsigned)WAVEFORM_SAMPLES,
                 (unsigned)(WAVEFORM_SAMPLES * sizeof(uint16_t)));
 
