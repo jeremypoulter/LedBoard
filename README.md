@@ -243,7 +243,7 @@ proportional to its binary weight (1, 2, 4, 8... cycles). A pixel's brightness i
 encoded by which planes its bit is set in.
 
 ```
-one address, BCM_BITS = 4:
+one address, BCM_BITS = 4 (illustration; 8 planes in practice):
 
   plane 0  shift 384 bits -> latch -> display  2 cycles   (weight 1)
   plane 1  shift 384 bits -> latch -> display  4 cycles   (weight 2)
@@ -255,40 +255,47 @@ Address lines only actually move at the first plane of each address (mirroring t
 original bit-bang driver, which touches `A0`/`A1` once per address); later planes of
 the same address hold the address steady, since no real transition is happening.
 
-`BCM_BITS` defaults to **4** (16 levels per channel, 4096 colours), chosen as a
-first, conservative step rather than jumping straight to full 8-bit depth, given how
-many real hardware surprises this board has produced through bring-up already. The
-cost of raising it is real and compounds per bit, since the fixed 390-cycle
-shift+latch overhead repeats for every plane, not just the display window.
+`BCM_BITS` now defaults to **8** (256 levels per channel, full 24-bit colour), the
+most the `uint8_t` channel type can express. It started at 4 as a conservative first
+step and was raised in stages as hardware testing showed what each limit really was;
+see the sections below. The cost of raising it compounds per bit, since the fixed
+390-cycle shift+latch overhead repeats for every plane, not just the display window.
+`BCM_BITS`, `BCM_BASE_CYCLES` and `FLOOR_CYCLES` can all be overridden from
+`build_flags` in `platformio.ini` (e.g. `-DBCM_BITS=7`) without editing the source.
 
 **`BCM_BASE_CYCLES`** (the shortest plane's display length, in shift-clock cycles)
-is just as important as `BCM_BITS` and easy to get badly wrong -- an earlier value of
-2 gave technically-correct relative dimming levels, but only a **1.9% duty cycle
-even at full white** (30 display cycles against 1560 cycles of repeated shift
-overhead), which read as "barely lit" rather than dim. The current value of 32
-targets roughly a **quarter of the time lit at full brightness** -- dimmer than the
-pre-BCM design's ~50% duty, but in the same order of magnitude rather than two
-orders of magnitude off:
+is just as important as `BCM_BITS` and easy to get badly wrong -- an early value of
+2 (at 4 bits) gave technically-correct relative dimming levels, but only a **1.9%
+duty cycle even at full white** (30 display cycles against 1560 cycles of repeated
+shift overhead), which read as "barely lit" rather than dim. Because the shift
+overhead is paid per plane, brightness, level count and refresh rate all trade
+against each other. Current options, including the extra floor plane described
+below (waveform = 8 bytes per cycle, internal RAM; staging = 2 bytes per cycle,
+PSRAM; refresh at the default 2 MHz):
 
-| `BCM_BITS` | `BASE` | Levels/channel | Max duty | DMA words | Buffer size | Refresh @ 2 MHz |
-|------------|--------|-----------------|----------|-----------|--------------|------------------|
-| -- (pre-BCM baseline) | -- | 2  | ~49.6%  | 3080  | ~54 KB  | ~649 Hz |
-| 2          | 32     | 4               | ~11.0%   | 3504      | ~62 KB       | ~571 Hz          |
-| 3          | 32     | 8               | ~16.1%   | 5576      | ~98 KB       | ~359 Hz          |
-| 4 (current)| 32     | 16              | ~23.5%   | 8160      | ~143 KB      | ~245 Hz          |
-| 5          | 32     | 32              | ~33.7%   | 11768     | ~207 KB      | ~170 Hz          |
+| `BCM_BITS` | `BASE` / `FLOOR` | Levels | Max duty | DMA words | Waveform (internal) | Staging (PSRAM) | Refresh |
+|------------|------------------|--------|----------|-----------|---------------------|-----------------|---------|
+| 4          | 32 / 8           | 16     | 19.7%    | 9752      | ~76 KB              | ~19 KB          | ~205 Hz |
+| 5          | 16 / 4           | 32     | 17.5%    | 11360     | ~89 KB              | ~22 KB          | ~176 Hz |
+| 6          | 8 / 2            | 64     | 15.6%    | 12944     | ~101 KB             | ~25 KB          | ~155 Hz |
+| 7          | 4 / 2            | 128    | 14.0%    | 14520     | ~113 KB             | ~28 KB          | ~138 Hz |
+| **8 (current)** | **4 / 2**   | 256    | 22.5%    | 18128     | ~142 KB             | ~35 KB          | ~110 Hz |
+| 8          | 2 / 1            | 256    | 12.7%    | 16084     | ~126 KB             | ~31 KB          | ~124 Hz |
+| 8          | 8 / 2            | 256    | 36.7%    | 22208     | ~174 KB             | ~43 KB          | ~90 Hz  |
 
 (Refresh and duty-cycle figures are computed from the I2S clock divider in
 [src/i2s_parallel.cpp](src/i2s_parallel.cpp) and the layout macros in
 [src/main.cpp](src/main.cpp), not measured -- at the default clock the divider
 reproduces the hardware-confirmed 649 Hz of the pre-BCM, single-plane design
-exactly, which is what makes the derived numbers above trustworthy.) `BCM_BITS` 5
-is the point where the ~184KB `dmaWaveform` buffer starts risking not finding a
-single contiguous block in the ESP32's internal DMA-capable RAM; both buffer
-allocations already fail safely with a `FATAL: could not allocate DMA buffer`
-halt-and-print rather than silent corruption. Raising `BCM_BASE_CYCLES` instead of
-`BCM_BITS` trades the same memory for brightness rather than for more levels --
-useful if 16 levels is enough but the panel still looks dim.
+exactly.) Refresh scales linearly with the pixel clock: the `+` key doubles it, so
+~110 Hz at 2 MHz becomes ~220 Hz at 4 MHz if the panel tolerates it. Allocation
+failure is reported at boot with a `FATAL: could not allocate DMA buffer` message
+rather than failing silently.
+
+*Correction:* earlier revisions of this table used 16 bytes per cycle for the
+waveform; it is 8 (four 16-bit samples). Every buffer size quoted in those older
+tables was about double the real figure, which made full 8-bit depth look out of
+reach when it fits comfortably.
 
 Two new test patterns exercise real dimming rather than solid on/off:
 
@@ -388,31 +395,37 @@ input maps to; it cannot invent new levels where none exist. At `BCM_BITS`=4 (16
 levels), the physical brightness step between adjacent high levels (e.g. 14 and 15)
 is only **~7%** -- a real hardware resolution limit, not a curve-shaping problem.
 
-The fix is more levels: `BCM_BITS` raised **4 -> 5** (32 levels), halving that
-top-end step to ~3.3%. Raising `BCM_BITS` alone at the existing `BCM_BASE_CYCLES`
-would have pushed the DMA buffer to ~235KB, a real risk of not finding one
-contiguous block of DMA-capable RAM, so `BCM_BASE_CYCLES` was halved **32 -> 16**
-(and `FLOOR_CYCLES` **8 -> 4** alongside it, keeping the same ratio) to compensate:
+The fix is more levels, which is why `BCM_BITS` was raised in stages: 4 -> 5 halved
+the top-end step to ~3.3%, and the final move to 8 bits (256 levels) brings it to
+~0.4%. `BCM_BASE_CYCLES` was halved with each extra bit (32 -> 16 -> 8 -> 4) to keep
+the shift overhead and buffer size in check; see the table above for the resulting
+trade-offs. `gammaStrength` was tuned by eye at 16 levels and may want re-tuning with
+`[` / `]` at 256.
 
-| | BITS=4 BASE=32 (previous) | BITS=5 BASE=32 (naive bump) | BITS=5 BASE=16 (current) |
-|---|---|---|---|
-| DMA words | 9752 | 13360 | 11360 |
-| Buffer size | ~171 KB | ~235 KB | ~200 KB |
-| Refresh | ~205 Hz | ~150 Hz | ~176 Hz |
-| Max brightness (duty) | 19.7% | 29.7% | 17.5% |
-| Top-level step | 7.1% | 3.3% | 3.3% |
+### PSRAM and the DMA buffer layout
 
-The rescaled version gets the same top-end improvement as the naive bump for a
-buffer size much closer to the ~171KB already confirmed working, at the cost of a
-small further drop in max brightness (19.7% -> 17.5%). All still comfortably above
-the flicker threshold. `gammaStrength` likely wants re-tuning by eye at the new
-level count -- the plateau-width calculation above was done for 16 levels, not 32.
+The module is an ESP32-WROVER with PSRAM, enabled in `platformio.ini`
+(`-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue`); without that define the build
+silently ignores the PSRAM. On the classic ESP32 the I2S DMA engine can only read
+internal SRAM, so the playback waveform has to stay there, but two things were
+changed to make the most of what is available:
+
+- The CPU-only staging buffer `dma[]` (expanded into the waveform by
+  `buildDmaWaveform()`, never read by hardware) lives in PSRAM.
+- The waveform is held as **one internal-RAM chunk per address** instead of a single
+  contiguous block, and `i2sParallelBegin()` takes a list of segments that its
+  descriptor chain plays back to back. This removes the risk of no single block of
+  free RAM being large enough.
+
+At boot the firmware prints free internal/DMA/PSRAM heap before and after allocating,
+so the real remaining headroom is visible rather than guessed.
 
 ### Remaining work
 
-1. **Raise `BCM_BITS`** once `BRIGHTNESS_RAMP` and `BREATHE` are confirmed clean on
-   hardware -- see the memory/refresh table above before picking a value.
-2. **Double buffering**, so drawing never tears against the running DMA chain.
+1. **Double buffering**, so drawing never tears against the running DMA chain. Because
+   PSRAM cannot back the DMA engine, a second waveform would need its own internal
+   RAM, or the picture could be composed in PSRAM and copied across.
+2. **Re-tune `gammaStrength`** (and perhaps the default clock) at 256 levels.
 
 ## References
 
