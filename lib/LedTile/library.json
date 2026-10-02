@@ -1,0 +1,9 @@
+{
+  "name": "LedTile",
+  "version": "0.1.0",
+  "description": "ESP32 I2S/DMA driver for the LED Tile v2 (64x16 RGB, MBI5034) with binary-code-modulated colour",
+  "keywords": "led, matrix, mbi5034, i2s, dma, esp32",
+  "repository": { "type": "git", "url": "https://github.com/jeremypoulter/LedBoard.git" },
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

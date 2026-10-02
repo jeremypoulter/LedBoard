@@ -30,9 +30,13 @@ typedef struct {
   size_t bytes;
 } I2SSegment;
 
+// port selects I2S0 or I2S1. I2S1 is the one proven on hardware; I2S0 is
+// untested and is shared with the DAC/ADC paths and often claimed by audio
+// code, so prefer I2S1 unless something else (e.g. WLED's I2S pixel outputs)
+// already owns it.
 bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
                       uint32_t clockHz, const I2SSegment *segments,
-                      size_t segmentCount, bool clockInvert);
+                      size_t segmentCount, bool clockInvert, uint8_t port = 1);
 
 // Real pixel clock after integer division, in Hz. Zero until begin() succeeds.
 uint32_t i2sParallelActualHz(void);

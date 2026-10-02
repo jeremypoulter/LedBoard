@@ -402,30 +402,61 @@ the shift overhead and buffer size in check; see the table above for the resulti
 trade-offs. `gammaStrength` was tuned by eye at 16 levels and may want re-tuning with
 `[` / `]` at 256.
 
-### PSRAM and the DMA buffer layout
+### The LedTile library
 
-The module is an ESP32-WROVER with PSRAM, enabled in `platformio.ini`
-(`-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue`); without that define the build
-silently ignores the PSRAM. On the classic ESP32 the I2S DMA engine can only read
-internal SRAM, so the playback waveform has to stay there, but two things were
-changed to make the most of what is available:
+Everything panel-specific lives in [lib/LedTile](lib/LedTile), a self-contained
+PlatformIO/Arduino library, so other projects (such as a WLED output bus) can reuse
+it. [src/main.cpp](src/main.cpp) is now just a demo and bring-up tool built on it.
 
-- The CPU-only staging buffer `dma[]` (expanded into the waveform by
-  `buildDmaWaveform()`, never read by hardware) lives in PSRAM.
-- The waveform is held as **one internal-RAM chunk per address** instead of a single
-  contiguous block, and `i2sParallelBegin()` takes a list of segments that its
-  descriptor chain plays back to back. This removes the risk of no single block of
-  free RAM being large enough.
+```cpp
+#include <LedTile.h>
 
-At boot the firmware prints free internal/DMA/PSRAM heap before and after allocating,
-so the real remaining headroom is visible rather than guessed.
+LedTile tile;
+
+void setup() {
+  LedTileConfig cfg;        // defaults match the ESP-WROVER-KIT wiring above
+  cfg.bcmBits = 8;          // 1-8 bits per channel; costs RAM and refresh rate
+  if (!tile.begin(cfg)) Serial.println(tile.lastError());
+  tile.setPixel(3, 4, 255, 0, 0);
+  tile.show();              // renders only the pixels that changed
+}
+```
+
+- **Configuration is runtime**, not macros: pins, `bcmBits`, `baseCycles`,
+  `floorCycles`, panel clock and the I2S port (1 is proven; 0 is untested) are all in
+  `LedTileConfig`, along with an optional `Print*` for boot diagnostics.
+- **Framebuffer with dirty tracking.** `setPixel()` stores into a 3 KB RGB buffer;
+  `show()` re-renders only changed pixels. Brightness, gamma on/off and gamma
+  strength re-render everything on the next `show()`.
+- **Brightness and gamma live in the library**: a single 256-entry table maps an
+  8-bit value through the perceptual curve, then brightness, then quantisation to
+  the configured depth. A host such as WLED should turn its own gamma off.
+- **`getPins()`** reports the seven GPIOs in use so a host framework can reserve
+  them. `end()` blanks the panel, releases the pins and frees all memory.
+- **Diagnostics** (`rawSetWord`, `rawFillCycles`, bit-bang transport,
+  `dmaStatus`) are kept for bring-up and are what the demo's test patterns use.
+
+### DMA buffer layout and PSRAM
+
+The waveform is held as **one internal-RAM chunk per address** instead of one large
+block, and `i2sParallelBegin()` takes a list of segments that its descriptor chain
+plays back to back, so only four medium-sized blocks need to be found. Pixel writes
+now go straight into the waveform, so the old CPU-side staging buffer (which briefly
+lived in PSRAM) no longer exists and **PSRAM is not used**; the build flag was
+removed. On the classic ESP32 the I2S DMA engine can only read internal SRAM, so
+the waveform has to stay there regardless.
+
+The library prints free DMA-capable heap before and after allocating, so the real
+headroom is visible. If WLED is the host, remember its WiFi stack and web server
+need a lot of internal RAM too; lower `bcmBits` (6 or 7) to make room.
 
 ### Remaining work
 
-1. **Double buffering**, so drawing never tears against the running DMA chain. Because
-   PSRAM cannot back the DMA engine, a second waveform would need its own internal
-   RAM, or the picture could be composed in PSRAM and copied across.
-2. **Re-tune `gammaStrength`** (and perhaps the default clock) at 256 levels.
+1. **WLED output bus** (`BusLedTile`) following upstream's HUB75 bus pattern, built
+   on the LedTile library.
+2. **True double buffering.** Updates are currently written in place, so a frame can
+   tear for at most one refresh; a second waveform would need its own internal RAM.
+3. **Re-tune `gammaStrength`** (and perhaps the default clock) at 256 levels.
 
 ## References
 

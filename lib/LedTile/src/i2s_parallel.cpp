@@ -14,8 +14,11 @@
 // is what distinguishes a running engine from a stalled one.
 #define MAX_DMA_LEN 2048
 
-// I2S1 is used rather than I2S0, which is entangled with the DAC and ADC paths.
-#define I2S_PORT I2S1
+// Selected per begin(); I2S1 is the default as I2S0 is entangled with the DAC
+// and ADC paths.
+static i2s_dev_t *sDev = &I2S1;
+static uint8_t sPort = 1;
+#define I2S_PORT (*sDev)
 
 static lldesc_t *sDesc = NULL;
 static int sDescCount = 0;
@@ -25,11 +28,14 @@ uint32_t i2sParallelActualHz(void) { return sActualHz; }
 
 bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
                       uint32_t clockHz, const I2SSegment *segments,
-                      size_t segmentCount, bool clockInvert) {
+                      size_t segmentCount, bool clockInvert, uint8_t port) {
   if (!busPins || !segments || segmentCount == 0 || clockHz == 0 ||
       busWidth == 0 || busWidth > 16) {
     return false;
   }
+
+  sPort = port ? 1 : 0;
+  sDev = sPort ? &I2S1 : &I2S0;
 
   // ---- descriptor chain, linked back to itself so playback loops forever ----
   sDescCount = 0;
@@ -73,8 +79,8 @@ bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
   // Reset as well as enable: begin() is called again whenever the clock or the
   // transport changes, and without the reset the peripheral keeps whatever
   // state the previous run left behind.
-  periph_module_reset(PERIPH_I2S1_MODULE);
-  periph_module_enable(PERIPH_I2S1_MODULE);
+  periph_module_reset(sPort ? PERIPH_I2S1_MODULE : PERIPH_I2S0_MODULE);
+  periph_module_enable(sPort ? PERIPH_I2S1_MODULE : PERIPH_I2S0_MODULE);
 
   // ---- pin routing ----
   //
@@ -86,11 +92,12 @@ bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
       continue;
     }
     pinMode(busPins[i], OUTPUT);
-    gpio_matrix_out(busPins[i], I2S1O_DATA_OUT8_IDX + i, false, false);
+    gpio_matrix_out(busPins[i], (sPort ? I2S1O_DATA_OUT8_IDX : I2S0O_DATA_OUT8_IDX) + i,
+                    false, false);
   }
   if (clkPin >= 0) {
     pinMode(clkPin, OUTPUT);
-    gpio_matrix_out(clkPin, I2S1O_WS_OUT_IDX, clockInvert, false);
+    gpio_matrix_out(clkPin, sPort ? I2S1O_WS_OUT_IDX : I2S0O_WS_OUT_IDX, clockInvert, false);
   }
 
   // ---- clock ----
