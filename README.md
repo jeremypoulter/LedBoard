@@ -304,6 +304,110 @@ Two new test patterns exercise real dimming rather than solid on/off:
 as before. The new `setPixelBrightness(x, y, uint8_t r, g, b)` is the real API,
 taking 0-255 per channel and using its top `BCM_BITS` bits.
 
+### Gamma correction
+
+Confirmed on hardware: linear duty cycle looks badly uneven to the eye -- a big
+jump in brightness from off to the lowest non-zero BCM level, then little
+perceptible change between the higher levels. This is expected: human brightness
+perception is close to a power law, not linear, so it amplifies differences at the
+low end and compresses them at the high end. A linear PWM duty cycle rides straight
+into that curve unmodified.
+
+A first attempt used a standard power-law gamma table (exponent 2.8, the common
+LED-strip default) and made things **worse**, confirmed on hardware: "almost half
+the screen is now black". The exponent is tuned for 8-bit-plus output, where
+compressing the dim end still leaves plenty of representable codes there; with only
+`BCM_BITS`=4 (16 levels), the same curve pushes **37%** of the 0-255 input range
+below the bottom representable code, so a third of the image rendered as literally
+off rather than dim. Two independent fixes, both needed:
+
+1. **The CIE 1931 perceptual lightness formula** instead of a raw power law. It has
+   a linear segment near black rather than a curve whose slope keeps falling all
+   the way to zero, so it loses less of the input range to the bottom code in the
+   first place (calculated: 30% instead of 37% -- better, but not sufficient alone).
+2. **A hard floor**: any input that is not exactly zero is guaranteed to round to at
+   least BCM level 1, never level 0. This is what actually closes the dead zone,
+   independent of the curve's shape.
+
+Both live in `buildGammaLUT()` and `setPixelBrightness()` in
+[src/main.cpp](src/main.cpp). Toggle the whole thing live with the `g` serial key to
+compare against uncorrected linear output -- both `BRIGHTNESS_RAMP` and `BREATHE` go
+through `setPixelBrightness()`, so either demonstrates the difference immediately.
+Gamma is on by default.
+
+Confirmed on hardware again, one layer deeper: even with both fixes above, there was
+still a visible jump from off to the dimmest representable brightness -- because the
+floor was forcing those values up to the SAME duty cycle as the main ladder's level
+1 (1.57%), not to something genuinely dimmer. The fix is a **dedicated extra bit
+plane** (`FLOOR_CYCLES` in [src/main.cpp](src/main.cpp)), smaller than the main
+ladder's own smallest level and used only for values gamma would otherwise crush to
+zero. Every level from 1 upward is untouched -- the floor plane is simply off
+whenever the main ladder has anything lit. Calculated result, at the current
+settings:
+
+```
+off      0.000%
+floor    0.328%   <- new, genuinely dim step
+level 1  1.313%
+level 2  2.625%
+...
+level 15 19.688%   (max brightness)
+```
+
+This costs one more full shift+latch pass per address (`TOTAL_PLANES = BCM_BITS +
+1`), which is not free: DMA words rise from 8160 to 9752, buffer size from ~143KB to
+~172KB, refresh from ~245Hz to ~205Hz, and max brightness drops slightly from 23.5%
+to 19.7% duty (more of every address's time is now spent on shift overhead rather
+than display). All still comfortably within the safe range established earlier in
+this document.
+
+### Gamma strength
+
+Confirmed on hardware, one more layer deeper: full-strength CIE1931 overcorrects.
+With only ~17 output levels total, the curve's low-end compression crams so many
+input values onto the same few dim codes that a visible, unchanging plateau appears
+before the ramp starts climbing -- reported as "the lower end is scaling very
+slowly". Calculated at full strength, the widest single-level plateau on the 64-wide
+`BRIGHTNESS_RAMP` is **19 pixels** -- nearly a third of it stuck on one level.
+
+Rather than pick one fixed replacement value, `gammaStrength` blends linearly
+between raw linear input (0%) and the full CIE1931 curve (100%), live-adjustable
+with `[` / `]` so it can be dialed in by eye without another edit-rebuild-reflash
+cycle. The default dropped from 100% to **50%**, which calculates out to a 7-pixel
+widest plateau -- a large reduction, and the rest of the ramp's level widths become
+far more even too (mostly 2-6 pixels, rather than one huge outlier next to several
+tiny ones). `g` still toggles the correction on/off entirely, independent of
+whatever strength `[`/`]` has set.
+
+### The limit of gamma correction, and more BCM levels
+
+Confirmed on hardware: once the low end was fixed, the **high end** still didn't
+look like it was changing. This is not something gamma correction can fix, at any
+strength or curve shape -- it only decides which of the *existing* output levels an
+input maps to; it cannot invent new levels where none exist. At `BCM_BITS`=4 (16
+levels), the physical brightness step between adjacent high levels (e.g. 14 and 15)
+is only **~7%** -- a real hardware resolution limit, not a curve-shaping problem.
+
+The fix is more levels: `BCM_BITS` raised **4 -> 5** (32 levels), halving that
+top-end step to ~3.3%. Raising `BCM_BITS` alone at the existing `BCM_BASE_CYCLES`
+would have pushed the DMA buffer to ~235KB, a real risk of not finding one
+contiguous block of DMA-capable RAM, so `BCM_BASE_CYCLES` was halved **32 -> 16**
+(and `FLOOR_CYCLES` **8 -> 4** alongside it, keeping the same ratio) to compensate:
+
+| | BITS=4 BASE=32 (previous) | BITS=5 BASE=32 (naive bump) | BITS=5 BASE=16 (current) |
+|---|---|---|---|
+| DMA words | 9752 | 13360 | 11360 |
+| Buffer size | ~171 KB | ~235 KB | ~200 KB |
+| Refresh | ~205 Hz | ~150 Hz | ~176 Hz |
+| Max brightness (duty) | 19.7% | 29.7% | 17.5% |
+| Top-level step | 7.1% | 3.3% | 3.3% |
+
+The rescaled version gets the same top-end improvement as the naive bump for a
+buffer size much closer to the ~171KB already confirmed working, at the cost of a
+small further drop in max brightness (19.7% -> 17.5%). All still comfortably above
+the flicker threshold. `gammaStrength` likely wants re-tuning by eye at the new
+level count -- the plateau-width calculation above was done for 16 levels, not 32.
+
 ### Remaining work
 
 1. **Raise `BCM_BITS`** once `BRIGHTNESS_RAMP` and `BREATHE` are confirmed clean on

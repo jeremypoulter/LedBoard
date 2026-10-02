@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <math.h>
 #include <rom/gpio.h>
 #include <soc/gpio_sig_map.h>
 #include <soc/gpio_struct.h>
@@ -88,33 +89,62 @@
 // bit is set in: lit in every plane gives full brightness; lit only in the
 // most significant plane gives roughly half; unlit in all gives off.
 //
-// BCM_BITS=4 gives 16 levels per channel (4096 colours) and is the starting
-// point: it keeps the DMA buffer growth to about 2x today's size, which seemed
-// the prudent first step to flash and verify given how many hardware surprises
-// this board has produced already. Once TEST_BRIGHTNESS_RAMP and TEST_BREATHE
-// are confirmed working cleanly, this can likely go to 5 or 6 -- see the
-// "Remaining work" section of README.md for the memory/refresh tradeoff at
-// each value before raising it.
-#define BCM_BITS 4
+// BCM_BITS=4 (16 levels per channel) was the conservative starting point, kept
+// until TEST_BRIGHTNESS_RAMP and TEST_BREATHE were confirmed working. Raised
+// to 5 (32 levels) once real hardware testing found the ACTUAL problem gamma
+// correction cannot fix: at 16 levels, consecutive HIGH levels (e.g. 14 vs 15)
+// differ by only ~7% in physical brightness, confirmed as "the brighter end
+// does not look to change". Gamma can only decide which of the existing
+// levels an input maps to -- it cannot invent extra levels where none exist,
+// so the only real fix is more of them. 32 levels halves that top-end gap to
+// ~3.3%. See the table in README.md for memory/refresh at each value before
+// raising further.
+#define BCM_BITS 5
 // Display length of the least-significant bit-plane, in shift-clock cycles.
 //
 // This controls overall brightness, not just the dimming resolution, and it is
 // easy to get badly wrong: the 384+6 cycle shift+latch overhead repeats for
 // EVERY plane (ADDR_BLOCK_CYCLES includes BCM_BITS copies of it), but the
-// panel is only actually lit during the display windows. At BCM_BITS=4 that
-// overhead is 4*390=1560 cycles; a too-small base of 2 gives display windows
-// of only 2+4+8+16=30 cycles, i.e. a 30/1560 = 1.9% duty cycle even at full
-// white -- technically correct dimming, but far too dim to look right.
+// panel is only actually lit during the display windows. At BCM_BITS=4 and a
+// too-small base of 2, the display windows summed to only 30 cycles against
+// 1560 of overhead -- 1.9% duty even at full white, technically correct
+// dimming but far too dim to look right (confirmed on hardware).
 //
-// 32 targets roughly a quarter of the panel's time lit at full brightness
-// (480/(1560+480) = 23.5%), a deliberate compromise against the pre-BCM
-// design's ~50% duty: matching that exactly would need base=104, taking the
-// DMA buffer to ~200KB, which risks not finding one contiguous block of the
-// ESP32's internal DMA-capable RAM. Raise this for more brightness at the cost
+// Halved from 32 to 16 alongside the BCM_BITS=4->5 bump: raising BCM_BITS
+// alone at the old base would have pushed the DMA buffer to ~235KB, a real
+// risk of not finding one contiguous block of the ESP32's internal
+// DMA-capable RAM. Halving the base keeps the buffer at ~200KB -- close to
+// the ~171KB already confirmed working -- while still gaining the extra bit
+// of resolution, at a small, acceptable cost in max brightness (19.7% -> 17.5%
+// duty). Raise this independently of BCM_BITS for more brightness at the cost
 // of memory (linear in BCM_BASE_CYCLES); see the table in README.md.
-#define BCM_BASE_CYCLES 32
+#define BCM_BASE_CYCLES 16
 static_assert(BCM_BITS >= 1 && BCM_BITS <= 8, "BCM_BITS must fit an 8-bit channel");
 static_assert(BCM_BASE_CYCLES >= 1, "a plane needs at least one display cycle");
+
+// A dedicated extra plane, dimmer than BCM_BASE_CYCLES, used ONLY for values
+// that the gamma floor (below) would otherwise have to round all the way up
+// to the main ladder's smallest level. Confirmed on hardware: without this,
+// the floor made "off" jump straight to the full brightness of level 1, with
+// no finer step in between -- a real gap, not just the inherent perceptual
+// jump of going from true darkness to any light at all.
+//
+// This is its own full shift+latch+display pass (one more plane means one
+// more 390-cycle shift pass, same as any other plane), so it is not free: see
+// FLOOR_CYCLES' contribution to ADDR_BLOCK_CYCLES below and the updated
+// table in README.md. Kept at a quarter of BCM_BASE_CYCLES, scaled down
+// alongside it when BCM_BASE_CYCLES halved from 32 to 16.
+#define FLOOR_CYCLES 4
+#define TOTAL_PLANES (BCM_BITS + 1)
+static_assert(FLOOR_CYCLES >= 1 && FLOOR_CYCLES < BCM_BASE_CYCLES,
+              "the floor plane must be dimmer than the smallest main level");
+
+// Display length of plane p, in shift-clock cycles: the main ladder is pure
+// powers of two (BCM_BASE_CYCLES << p) for p = 0..BCM_BITS-1; the extra floor
+// plane at index BCM_BITS is not part of that progression.
+static constexpr int planeWeight(uint8_t p) {
+  return (p < BCM_BITS) ? (BCM_BASE_CYCLES << p) : FLOOR_CYCLES;
+}
 
 // ---------------------------------------------------------------- DMA layout
 //
@@ -124,13 +154,15 @@ static_assert(BCM_BASE_CYCLES >= 1, "a plane needs at least one display cycle");
 #define LATCH_CYCLES 6
 #define SAMPLES_PER_CYCLE 4
 
-// Sum of 2^0 .. 2^(BCM_BITS-1), i.e. the total display cycles for one address
-// if every plane fired consecutively.
+// Sum of 2^0 .. 2^(BCM_BITS-1), i.e. the total display cycles of the main
+// ladder alone (not counting the floor plane) if every plane fired consecutively.
 #define BCM_WEIGHT_SUM ((1u << BCM_BITS) - 1)
-// One address now costs BCM_BITS complete shift+latch passes, plus the sum of
-// every plane's weighted display window.
-#define ADDR_BLOCK_CYCLES \
-  (BCM_BITS * (SHIFT_CYCLES + LATCH_CYCLES) + BCM_BASE_CYCLES * BCM_WEIGHT_SUM)
+// One address now costs TOTAL_PLANES complete shift+latch passes (the main
+// ladder plus the floor plane), plus the sum of every plane's weighted
+// display window.
+#define ADDR_BLOCK_CYCLES                                        \
+  (TOTAL_PLANES * (SHIFT_CYCLES + LATCH_CYCLES) +                \
+   BCM_BASE_CYCLES * BCM_WEIGHT_SUM + FLOOR_CYCLES)
 #define DMA_WORDS (ADDR_COUNT * ADDR_BLOCK_CYCLES)
 #define WAVEFORM_SAMPLES (DMA_WORDS * SAMPLES_PER_CYCLE)
 
@@ -138,15 +170,15 @@ static uint16_t *dma = NULL;  // [addr][plane][cycle], flattened
 static uint32_t *dmaWaveform = NULL;
 
 // Offset, in cycles, of each plane's block within one address's span. Computed
-// once at startup since BCM_BASE_CYCLES << p is cheap but not worth repeating
-// on every cell() call.
-static int planeStart[BCM_BITS];
+// once at startup since planeWeight() is cheap but not worth repeating on
+// every cell() call.
+static int planeStart[TOTAL_PLANES];
 
 static void computePlaneLayout() {
   int offset = 0;
-  for (int p = 0; p < BCM_BITS; ++p) {
+  for (int p = 0; p < TOTAL_PLANES; ++p) {
     planeStart[p] = offset;
-    offset += SHIFT_CYCLES + LATCH_CYCLES + (BCM_BASE_CYCLES << p);
+    offset += SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p);
   }
   if (offset != ADDR_BLOCK_CYCLES) {
     Serial.printf("FATAL: plane layout mismatch (%d != %d)\n", offset,
@@ -165,8 +197,8 @@ static inline uint16_t *cell(uint8_t addr, uint8_t plane, int cycleIdx) {
 // data bits are layered on top afterwards and never disturb these.
 static void buildControl() {
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
-      const int displayCycles = BCM_BASE_CYCLES << p;
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
+      const int displayCycles = planeWeight(p);
       const int blockCycles = SHIFT_CYCLES + LATCH_CYCLES + displayCycles;
       // Address lines only actually move at the first plane of each address;
       // every later plane of the same address is not a real address
@@ -213,7 +245,7 @@ static void buildDmaWaveform() {
     // it the same way buildControl did, rather than re-deriving which plane.
     const int cycleInAddr = i % ADDR_BLOCK_CYCLES;
     bool inShift = false;
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
       if (cycleInAddr >= planeStart[p] && cycleInAddr < planeStart[p] + SHIFT_CYCLES) {
         inShift = true;
         break;
@@ -229,8 +261,8 @@ static void buildDmaWaveform() {
 static bool validateDmaWaveform() {
   uint16_t previous = BUS_OE;
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
-      const int displayCycles = BCM_BASE_CYCLES << p;
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
+      const int displayCycles = planeWeight(p);
       const int blockCycles = SHIFT_CYCLES + LATCH_CYCLES + displayCycles;
       unsigned shifted = 0;
       unsigned latches = 0;
@@ -288,15 +320,15 @@ static inline void setStreamBit(uint8_t addr, uint8_t plane, uint8_t bank,
 // byte is sent first, matching how the bit-banged driver packed p[0] and p[1].
 //
 // This is the diagnostic/raw primitive used by the geometry test patterns
-// below: it sets the SAME bit identically across every BCM plane, which is
-// exactly "full brightness" or "off" and so reproduces their pre-BCM behaviour
-// unchanged.
+// below: it sets the SAME bit identically across every plane, including the
+// floor plane, which is exactly "full brightness" or "off" and so reproduces
+// their pre-BCM behaviour unchanged.
 static void setWord(uint8_t addr, uint8_t bank, uint8_t group, uint8_t colour,
                     uint16_t bits) {
   for (uint8_t b = 0; b < 16; ++b) {
     uint8_t byteIdx = group * 6 + colour * 2 + ((b >= 8) ? 0 : 1);
     bool on = (bits >> b) & 0x01;
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
       setStreamBit(addr, p, bank, byteIdx, b & 7, on);
     }
   }
@@ -304,7 +336,7 @@ static void setWord(uint8_t addr, uint8_t bank, uint8_t group, uint8_t colour,
 
 static void clearAll() {
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
       for (int c = 0; c < SHIFT_CYCLES; ++c) {
         *cell(a, p, c) &= (uint16_t)~(BUS_D1 | BUS_D2);
       }
@@ -357,30 +389,111 @@ static void setPixel(uint8_t x, uint8_t y, bool r, bool g, bool b) {
   }
   const bool on[3] = {b, g, r};  // COL_B, COL_G, COL_R
   for (uint8_t c = 0; c < 3; ++c) {
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
       setStreamBit(s.addr, p, s.bank, s.group * 6 + c * 2 + s.halfIdx, s.bitInByte, on[c]);
     }
   }
 }
 
+// ------------------------------------------------------------ gamma correction
+//
+// Human brightness perception is roughly a power law, not linear, so a LINEAR
+// duty cycle looks badly uneven: the very first non-zero BCM level already
+// reads as surprisingly bright (confirmed on hardware -- "big jump from off to
+// the lowest setting"), while steps at the high end become hard to tell apart.
+//
+// A naive power-law gamma (first tried here at exponent 2.8, the common
+// LED-strip default) makes this WORSE with only BCM_BITS=4 output levels: it
+// is tuned for 8-bit-plus output, where compressing the low end still leaves
+// many representable codes there. Confirmed on hardware and by direct
+// calculation: at 2.8, fully 37% of the 0-255 input range maps to output level
+// 0 -- not dim, literally off -- which is what showed up as "almost half the
+// screen is now black". The CIE 1931 perceptual lightness formula below has a
+// LINEAR segment near black rather than a curve that keeps compressing all the
+// way to zero slope, so it loses less of the input range to the bottom code
+// in the first place (calculated: 30% instead of 37% -- better, but, on its
+// own, still a real dead zone).
+//
+// What actually closes that dead zone is the dedicated floor plane defined
+// above (FLOOR_CYCLES / TOTAL_PLANES): any value gamma still rounds down to
+// output level 0 lights that plane instead of nothing, which is a genuinely
+// dimmer step than the main ladder's level 1, not the same brightness forced
+// up to meet it (confirmed on hardware as the difference between "a bit dim"
+// and "jumps straight to level 1 with no step in between").
+//
+// Full-strength CIE1931 then turned out to overcorrect: with only ~17 output
+// levels total, the curve's low-end compression crams so many input values
+// onto the same few dim codes that a visible, unchanging plateau appears
+// before the ramp starts climbing (confirmed on hardware as "the lower end is
+// scaling very slowly"; calculated at full strength, the widest single-level
+// plateau on a 64-wide ramp is 19 pixels -- nearly a third of it). Rather than
+// pick one fixed compromise, gammaStrength blends linearly between the raw
+// input (0.0) and the full CIE1931 curve (1.0), and is adjustable live with
+// '[' / ']' rather than needing another edit-rebuild-reflash cycle to tune by
+// eye. 0.5 is the new default (calculated widest plateau: 7 pixels).
+//
+// Toggle the correction on/off entirely with 'g', independent of strength.
+static uint8_t gammaLUT[256];
+static bool gammaEnabled = true;
+static float gammaStrength = 0.5f;
+
+static void buildGammaLUT() {
+  for (int i = 0; i < 256; ++i) {
+    // Treat i/255 as perceptual lightness L* on the standard 0-100 scale, and
+    // convert to relative luminance Y (0-1) with the CIE 1931 formula.
+    float Lstar = (i / 255.0f) * 100.0f;
+    float Y;
+    if (Lstar <= 8.0f) {
+      Y = Lstar / 903.3f;
+    } else {
+      float t = (Lstar + 16.0f) / 116.0f;
+      Y = t * t * t;
+    }
+    float corrected = Y * 255.0f;
+    float blended = i + (corrected - i) * gammaStrength;
+    if (blended < 0.0f) blended = 0.0f;
+    if (blended > 255.0f) blended = 255.0f;
+    gammaLUT[i] = (uint8_t)(blended + 0.5f);
+  }
+}
+
+static inline uint8_t applyGamma(uint8_t value) {
+  return gammaEnabled ? gammaLUT[value] : value;
+}
+
 // Real per-pixel dimming. r/g/b are 0-255; only the top BCM_BITS bits of each
-// are used, since that is all the hardware currently has bit planes for --
-// e.g. at BCM_BITS=4, values 0x00-0x0F and 0x10-0x1F both render identically.
+// are used for the main ladder, since that is all the hardware has bit planes
+// for -- e.g. at BCM_BITS=4, values 0x00-0x0F and 0x10-0x1F both render
+// identically on the main ladder. Gamma correction (when enabled) is applied
+// here, before that reduction, so it reshapes which 0-255 input maps to which
+// of the BCM_BITS output levels rather than just scaling an already-quantised
+// value.
+//
+// Values gamma pushes below the main ladder's smallest level light ONLY the
+// dedicated floor plane instead -- a genuinely finer, dimmer rung between true
+// off and the main ladder's level 1, rather than a jump straight to it. Every
+// level from 1 upward is completely unaffected: the floor plane is off
+// whenever the main ladder has anything lit.
 static void setPixelBrightness(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b) {
   PixelSlot s;
   if (!pixelSlot(x, y, &s)) {
     return;
   }
-  const uint8_t reduced[3] = {
-      (uint8_t)(b >> (8 - BCM_BITS)),
-      (uint8_t)(g >> (8 - BCM_BITS)),
-      (uint8_t)(r >> (8 - BCM_BITS)),
-  };  // COL_B, COL_G, COL_R
+  const uint8_t in[3] = {b, g, r};  // COL_B, COL_G, COL_R
+  uint8_t mainLevel[3];
+  bool useFloor[3];
+  for (uint8_t c = 0; c < 3; ++c) {
+    uint8_t level = applyGamma(in[c]) >> (8 - BCM_BITS);
+    useFloor[c] = (in[c] != 0 && level == 0);
+    mainLevel[c] = level;
+  }
   for (uint8_t c = 0; c < 3; ++c) {
     for (uint8_t p = 0; p < BCM_BITS; ++p) {
-      bool on = (reduced[c] >> p) & 0x01;
+      bool on = (mainLevel[c] >> p) & 0x01;
       setStreamBit(s.addr, p, s.bank, s.group * 6 + c * 2 + s.halfIdx, s.bitInByte, on);
     }
+    setStreamBit(s.addr, BCM_BITS, s.bank, s.group * 6 + c * 2 + s.halfIdx, s.bitInByte,
+                useFloor[c]);
   }
 }
 
@@ -430,7 +543,7 @@ static void patternCycleRuler(uint32_t step) {
   if (upto > SHIFT_CYCLES) {
     upto = SHIFT_CYCLES;
   }
-  for (uint8_t p = 0; p < BCM_BITS; ++p) {
+  for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
     for (int c = 0; c < upto; ++c) {
       *cell(0, p, c) |= (uint16_t)(BUS_D1 | BUS_D2);
     }
@@ -619,7 +732,7 @@ static void releasePinsToGpio() {
 // mapping are both good and any fault lies in the I2S peripheral instead.
 static void bitbangRefresh() {
   for (uint8_t a = 0; a < ADDR_COUNT; ++a) {
-    for (uint8_t p = 0; p < BCM_BITS; ++p) {
+    for (uint8_t p = 0; p < TOTAL_PLANES; ++p) {
       digitalWrite(PIN_OE, HIGH);
 
       for (int c = 0; c < SHIFT_CYCLES; ++c) {
@@ -638,7 +751,9 @@ static void bitbangRefresh() {
       digitalWrite(PIN_LAT, LOW);
 
       digitalWrite(PIN_OE, LOW);
-      delayMicroseconds(20u << p);
+      // planeWeight(), not a power-of-two shift: the floor plane (index
+      // BCM_BITS) is deliberately smaller than the main ladder's plane 0.
+      delayMicroseconds(planeWeight(p));
       digitalWrite(PIN_OE, HIGH);
     }
   }
@@ -673,11 +788,15 @@ void setup() {
   // If this number climbs on its own, the sketch is crash-looping rather than
   // sitting still, and the DMA is simply replaying its last buffer.
   Serial.printf("boot #%u\n", (unsigned)++bootCount);
-  Serial.printf("BCM: %u bits (%u levels/channel), base %u cycles\n",
+  Serial.printf("BCM: %u bits (%u levels/channel), base %u cycles, "
+                "+1 floor plane at %u cycles\n",
                 (unsigned)BCM_BITS, (unsigned)(1u << BCM_BITS),
-                (unsigned)BCM_BASE_CYCLES);
+                (unsigned)BCM_BASE_CYCLES, (unsigned)FLOOR_CYCLES);
+  Serial.printf("gamma: %s (CIE1931 blend %.0f%%, floored to the floor plane)\n",
+                gammaEnabled ? "ON" : "OFF", (double)(gammaStrength * 100.0f));
 
   computePlaneLayout();
+  buildGammaLUT();
 
   dma = (uint16_t *)heap_caps_malloc(DMA_WORDS * sizeof(uint16_t),
                                      MALLOC_CAP_DMA);
@@ -711,6 +830,7 @@ void setup() {
   Serial.println("keys: n/./, = mode and step, a = auto,");
   Serial.println("      + / - = clock, r = redraw");
   Serial.println("      d = toggle DMA / bit-bang transport");
+  Serial.println("      g = toggle gamma correction, [ / ] = gamma strength");
   Serial.println("      c = cycle ruler (starts at one block)");
   Serial.println();
   {
@@ -779,11 +899,24 @@ void loop() {
       }
     } else if (c == 'i') {
       Serial.println("CLK is DMA-encoded; polarity is fixed to rising-edge shifting.");
+    } else if (c == 'g') {
+      gammaEnabled = !gammaEnabled;
+      redraw = true;
+      Serial.printf("gamma: %s (CIE1931 blend %.0f%%, floored to the floor plane)\n",
+                    gammaEnabled ? "ON" : "OFF", (double)(gammaStrength * 100.0f));
+    } else if (c == '[' || c == ']') {
+      gammaStrength += (c == ']') ? 0.1f : -0.1f;
+      if (gammaStrength < 0.0f) gammaStrength = 0.0f;
+      if (gammaStrength > 1.0f) gammaStrength = 1.0f;
+      buildGammaLUT();
+      redraw = true;
+      Serial.printf("gamma strength: %.0f%% (0%%=linear, 100%%=full CIE1931)\n",
+                    (double)(gammaStrength * 100.0f));
     } else if (c == 'r') {
       redraw = true;
     } else if (c == '?') {
-      Serial.println("n/./, = mode and step, a = auto, + - = clock, "
-                     "r = redraw, c = cycle ruler, d = transport");
+      Serial.println("n/./, = mode and step, a = auto, + - = clock, g = gamma, "
+                     "[ ] = gamma strength, r = redraw, c = cycle ruler, d = transport");
     }
   }
 
