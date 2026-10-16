@@ -40,6 +40,8 @@ bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
 
 // Real pixel clock after integer division, in Hz. Zero until begin() succeeds.
 uint32_t i2sParallelActualHz(void);
+bool i2sParallelActive(void);
+size_t i2sParallelDescriptorBytes(size_t segmentBytes, size_t segmentCount);
 
 void i2sParallelStop(void);
 

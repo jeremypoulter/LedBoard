@@ -98,8 +98,8 @@ own supply, and only the ground is shared with the ESP32.
      GPIO19  >--------------------------------->   LAT   pin 2
      GPIO21  >--------------------------------->   OE    pin 6
      GPIO22  >--------------------------------->   A0    pin 7
-     GPIO23  >--------------------------------->   A1    pin 4
-                                                   NC    pin 3  (leave open)
+      GPIO23  >--------------------------------->   A1    pin 3
+                                                    NC    pin 4  (leave open)
 
         GND  o------------------+------------->   GND header (all 8 pins)
                                 |
@@ -283,6 +283,12 @@ PSRAM; refresh at the default 2 MHz):
 | 8          | 2 / 1            | 256    | 12.7%    | 16084     | ~126 KB             | ~31 KB          | ~124 Hz |
 | 8          | 8 / 2            | 256    | 36.7%    | 22208     | ~174 KB             | ~43 KB          | ~90 Hz  |
 
+This table records the earlier bring-up profiles. The current library adds a
+separate one-cycle blanking margin after each plane, preserving the exact BCM ON
+weight rather than subtracting one from it. It also writes directly to the DMA
+waveform and no longer allocates the staging column shown above. Use
+`LedTile::waveformBytesForConfig()` and `refreshHz()` for the current layout.
+
 (Refresh and duty-cycle figures are computed from the I2S clock divider in
 [src/i2s_parallel.cpp](src/i2s_parallel.cpp) and the layout macros in
 [src/main.cpp](src/main.cpp), not measured -- at the default clock the divider
@@ -448,12 +454,15 @@ the waveform has to stay there regardless.
 
 The library prints free DMA-capable heap before and after allocating, so the real
 headroom is visible. If WLED is the host, remember its WiFi stack and web server
-need a lot of internal RAM too; lower `bcmBits` (6 or 7) to make room.
+need a lot of internal RAM too. The WLED integration starts at 4 bits with a
+conservative timing profile; see [reference/WLED.md](reference/WLED.md) before
+raising depth or changing WLED's memory budget.
 
 ### Remaining work
 
-1. **WLED output bus** (`BusLedTile`) following upstream's HUB75 bus pattern, built
-   on the LedTile library.
+1. **Validate the WLED output bus** (`BusLedTile`) on hardware. The sibling WLED
+   checkout now has the native integration; see [reference/WLED.md](reference/WLED.md)
+   for the build profile, configuration and acceptance checklist.
 2. **True double buffering.** Updates are currently written in place, so a frame can
    tear for at most one refresh; a second waveform would need its own internal RAM.
 3. **Re-tune `gammaStrength`** (and perhaps the default clock) at 256 levels.

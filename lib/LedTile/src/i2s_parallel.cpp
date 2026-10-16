@@ -1,7 +1,12 @@
 #include "i2s_parallel.h"
 
 #include <Arduino.h>
+#include <esp_idf_version.h>
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include <esp_private/periph_ctrl.h>
+#else
 #include <driver/periph_ctrl.h>
+#endif
 #include <esp_heap_caps.h>
 #include <rom/gpio.h>
 #include <soc/gpio_sig_map.h>
@@ -25,11 +30,15 @@ static int sDescCount = 0;
 static uint32_t sActualHz = 0;
 
 uint32_t i2sParallelActualHz(void) { return sActualHz; }
+bool i2sParallelActive(void) { return sDesc != nullptr; }
+size_t i2sParallelDescriptorBytes(size_t segmentBytes, size_t segmentCount) {
+  return ((segmentBytes + MAX_DMA_LEN - 1) / MAX_DMA_LEN) * segmentCount * sizeof(lldesc_t);
+}
 
 bool i2sParallelBegin(const int8_t *busPins, uint8_t busWidth, int8_t clkPin,
                       uint32_t clockHz, const I2SSegment *segments,
                       size_t segmentCount, bool clockInvert, uint8_t port) {
-  if (!busPins || !segments || segmentCount == 0 || clockHz == 0 ||
+  if (sDesc || port > 1 || !busPins || !segments || segmentCount == 0 || clockHz == 0 ||
       busWidth == 0 || busWidth > 16) {
     return false;
   }

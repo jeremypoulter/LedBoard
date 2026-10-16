@@ -19,6 +19,10 @@
 
 #include <Arduino.h>
 
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+#error "LedTile currently supports only the classic ESP32 I2S LCD peripheral"
+#endif
+
 #include "i2s_parallel.h"
 
 struct LedTileConfig {
@@ -36,7 +40,7 @@ struct LedTileConfig {
   // shift+latch pass per address, so it costs RAM and refresh rate.
   uint8_t bcmBits = 8;
   // Display length of the shortest bit plane, in panel clock cycles. Together
-  // with bcmBits this sets maximum brightness: the 390-cycle shift overhead is
+  // with bcmBits this sets maximum brightness: the 391-cycle shift/latch/blank overhead is
   // paid per plane, but only the display windows light the panel.
   uint16_t baseCycles = 4;
   // Display length of the extra "floor" plane that lights values the gamma
@@ -109,6 +113,9 @@ class LedTile {
   uint8_t bcmBits() const { return _cfg.bcmBits; }
   uint32_t levels() const { return 1u << _cfg.bcmBits; }
   size_t waveformBytes() const;
+  // Allocation estimates include the blanking margin after each display window.
+  static size_t waveformBytesForConfig(const LedTileConfig &cfg);
+  static size_t dmaBytesForConfig(const LedTileConfig &cfg);
   const char *lastError() const { return _error; }
   bool dmaStatus(I2SParallelStatus *out) const;
   bool waitForFrame(uint32_t timeoutUs);
@@ -164,7 +171,7 @@ class LedTile {
   float _gammaStrength = 0.5f;
   uint16_t _lut[256];           // input value -> BCM level
 
-  uint8_t _fb[kPixels * 3];     // r, g, b per pixel
-  uint8_t _dirty[kPixels / 8];
+  uint8_t _fb[kPixels * 3] = {};     // r, g, b per pixel
+  uint8_t _dirty[kPixels / 8] = {};
   bool _allDirty = false;
 };

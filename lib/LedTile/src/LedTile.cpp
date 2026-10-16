@@ -1,6 +1,7 @@
 #include "LedTile.h"
 
 #include <esp_heap_caps.h>
+#include <driver/gpio.h>
 #include <math.h>
 #include <rom/gpio.h>
 #include <soc/gpio_sig_map.h>
@@ -24,6 +25,8 @@ const uint16_t BUS_CLK = 1u << 6;
 const int SHIFT_CYCLES = 384;
 // Keep CLK low before, during and after LAT.
 const int LATCH_CYCLES = 6;
+// A separate blank cycle preserves the exact binary weight of every ON window.
+const int BLANK_CYCLES = 1;
 // Each shift cycle is encoded as CLK low, low, high, high.
 const int SAMPLES_PER_CYCLE = 4;
 const int ADDR_COUNT = 4;
@@ -90,12 +93,25 @@ bool LedTile::begin(const LedTileConfig &cfg) {
   if (cfg.baseCycles < 1 || cfg.floorCycles < 1 || cfg.floorCycles >= cfg.baseCycles)
     return setError("need 1 <= floorCycles < baseCycles");
   if (cfg.clockHz < 100000 || cfg.clockHz > 8000000) return setError("clockHz out of range");
+  if (cfg.i2sPort > 1) return setError("i2sPort must be 0 or 1");
+  const int8_t pins[kPinCount] = {cfg.pinD1, cfg.pinD2, cfg.pinLat, cfg.pinOe,
+                                  cfg.pinA0, cfg.pinA1, cfg.pinClk};
+  for (uint8_t i = 0; i < kPinCount; ++i) {
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(pins[i]) || (pins[i] >= 6 && pins[i] <= 11))
+      return setError("invalid or flash-reserved output pin");
+    for (uint8_t j = 0; j < i; ++j)
+      if (pins[i] == pins[j]) return setError("duplicate panel pin");
+  }
+  // A second instance must not disturb the descriptor chain of the first one.
+  if (i2sParallelActive()) return setError("I2S parallel transport already in use");
+  pinMode(cfg.pinOe, OUTPUT);
+  digitalWrite(cfg.pinOe, HIGH);
 
   _planes = cfg.bcmBits + 1;
   int offset = 0;
   for (int p = 0; p < _planes; ++p) {
     _planeStart[p] = offset;
-    offset += SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p);
+    offset += SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p) + BLANK_CYCLES;
   }
   _addrBlock = offset;
   _wordsPerAddr = (size_t)_addrBlock * 2;
@@ -163,6 +179,19 @@ size_t LedTile::waveformBytes() const {
   return _wave[0] ? ADDR_COUNT * _wordsPerAddr * sizeof(uint32_t) : 0;
 }
 
+size_t LedTile::waveformBytesForConfig(const LedTileConfig &cfg) {
+  if (cfg.bcmBits < 1 || cfg.bcmBits > 8 || cfg.baseCycles < 2 ||
+      cfg.floorCycles < 1 || cfg.floorCycles >= cfg.baseCycles) return 0;
+  const size_t cycles = (cfg.bcmBits + 1) * (SHIFT_CYCLES + LATCH_CYCLES + BLANK_CYCLES)
+                     + (size_t)cfg.baseCycles * ((1u << cfg.bcmBits) - 1) + cfg.floorCycles;
+  return ADDR_COUNT * cycles * SAMPLES_PER_CYCLE * sizeof(uint16_t);
+}
+
+size_t LedTile::dmaBytesForConfig(const LedTileConfig &cfg) {
+  const size_t bytes = waveformBytesForConfig(cfg);
+  return bytes ? bytes + i2sParallelDescriptorBytes(bytes / ADDR_COUNT, ADDR_COUNT) : 0;
+}
+
 uint8_t LedTile::getPins(uint8_t *out) const {
   const int8_t pins[kPinCount] = {_cfg.pinD1, _cfg.pinD2, _cfg.pinLat, _cfg.pinOe,
                                   _cfg.pinA0, _cfg.pinA1, _cfg.pinClk};
@@ -175,7 +204,7 @@ uint8_t LedTile::getPins(uint8_t *out) const {
 void LedTile::buildWaveform() {
   for (int a = 0; a < ADDR_COUNT; ++a) {
     for (int p = 0; p < _planes; ++p) {
-      const int block = SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p);
+      const int block = SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p) + BLANK_CYCLES;
       // The address lines only move at the first plane of each address; later
       // planes of the same address hold steady. While the first plane shifts,
       // the previous address is held, matching the original bit-bang driver.
@@ -198,7 +227,7 @@ void LedTile::buildWaveform() {
   }
 }
 
-// Structural check of the encoded waveform before any hardware is touched:
+// Structural check of the encoded waveform before DMA starts:
 // exactly SHIFT_CYCLES rising clocks and one clock-low latch per plane, the
 // panel blanked whenever it shifts or latches, and the address steady whenever
 // it is lit. Catches layout off-by-ones as a boot-time error.
@@ -206,8 +235,8 @@ bool LedTile::validateWaveform() const {
   uint16_t previous = BUS_OE;
   for (int a = 0; a < ADDR_COUNT; ++a) {
     for (int p = 0; p < _planes; ++p) {
-      const int block = SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p);
-      unsigned shifted = 0, latches = 0;
+      const int block = SHIFT_CYCLES + LATCH_CYCLES + planeWeight(p) + BLANK_CYCLES;
+      unsigned shifted = 0, latches = 0, enabledSamples = 0;
       for (int lc = 0; lc < block; ++lc) {
         const int idx = _planeStart[p] + lc;
         for (int s = 0; s < SAMPLES_PER_CYCLE; ++s) {
@@ -232,10 +261,12 @@ bool LedTile::validateWaveform() const {
             const unsigned address = ((value & BUS_A0) ? 1 : 0) | ((value & BUS_A1) ? 2 : 0);
             if (address != (unsigned)a || latches != 1 || (value & BUS_CLK)) return false;
           }
+          if (!(value & BUS_OE)) ++enabledSamples;
           previous = value;
         }
       }
-      if (shifted != (unsigned)SHIFT_CYCLES || latches != 1) return false;
+      if (shifted != (unsigned)SHIFT_CYCLES || latches != 1 ||
+          enabledSamples != (unsigned)(planeWeight(p) * SAMPLES_PER_CYCLE)) return false;
     }
   }
   return true;
@@ -412,7 +443,12 @@ void LedTile::stopI2S() {
 void LedTile::releasePinsToGpio() {
   const int8_t pins[kPinCount] = {_cfg.pinD1, _cfg.pinD2, _cfg.pinLat, _cfg.pinOe,
                                   _cfg.pinA0, _cfg.pinA1, _cfg.pinClk};
+  // Disconnect and blank OE first; never briefly enable a stale latched row.
+  gpio_matrix_out(_cfg.pinOe, SIG_GPIO_OUT_IDX, false, false);
+  pinMode(_cfg.pinOe, OUTPUT);
+  digitalWrite(_cfg.pinOe, HIGH);
   for (uint8_t i = 0; i < kPinCount; ++i) {
+    if (pins[i] == _cfg.pinOe) continue;
     gpio_matrix_out(pins[i], SIG_GPIO_OUT_IDX, false, false);
     pinMode(pins[i], OUTPUT);
     digitalWrite(pins[i], LOW);
@@ -422,10 +458,14 @@ void LedTile::releasePinsToGpio() {
 
 bool LedTile::setClockHz(uint32_t hz) {
   if (hz < 100000 || hz > 8000000) return false;
+  const uint32_t previousHz = _cfg.clockHz;
   _cfg.clockHz = hz;
   if (_running && _transport == TRANSPORT_DMA) {
     stopI2S();
-    return startI2S();
+    if (startI2S()) return true;
+    _cfg.clockHz = previousHz;
+    if (!startI2S()) end();
+    return setError("I2S clock restart failed");
   }
   return true;
 }
@@ -443,7 +483,11 @@ void LedTile::setTransport(Transport t) {
     _transport = t;
   } else {
     _transport = t;
-    startI2S();
+    if (!startI2S()) {
+      _transport = TRANSPORT_BITBANG;
+      releasePinsToGpio();
+      setError("I2S transport restart failed");
+    }
   }
 }
 
@@ -492,7 +536,7 @@ bool LedTile::waitForFrame(uint32_t timeoutUs) {
 
 void LedTile::rawSetWord(uint8_t addr, uint8_t bank, uint8_t group, uint8_t colour,
                          uint16_t bits) {
-  if (!_wave[0] || addr >= ADDR_COUNT) return;
+  if (!_wave[0] || addr >= ADDR_COUNT || bank > 1 || group >= 8 || colour >= 3) return;
   for (uint8_t b = 0; b < 16; ++b) {
     const uint8_t byteIdx = group * 6 + colour * 2 + ((b >= 8) ? 0 : 1);
     const bool on = (bits >> b) & 1;
