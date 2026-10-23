@@ -18,6 +18,14 @@ npm.cmd run build
 pio run -e esp32_ledtile
 ```
 
+The sample override also defines `esp32_huzzah32_ledtile` for the original
+Adafruit HUZZAH32 Feather. Build/upload that target with:
+
+```powershell
+pio run -e esp32_huzzah32_ledtile
+pio run -e esp32_huzzah32_ledtile --target upload
+```
+
 The output is `WLED/.pio/build/esp32_ledtile/firmware.bin`. Building does not flash
 the controller. The default environment uses WLED's Arduino 3 / ESP-IDF 5 setup,
 the `esp-wrover-kit` board, and no usermods. Do not enable HUB75 or audio-reactive
@@ -33,23 +41,50 @@ Windows archive-extraction path-length limit, without changing the registry:
 $env:PLATFORMIO_CORE_DIR = "$env:LOCALAPPDATA\Temp\opencode\wled-ledtile-pio"
 $env:PLATFORMIO_CACHE_DIR = "$env:USERPROFILE\.platformio\.cache"
 $env:PLATFORMIO_PLATFORMS_DIR = "$env:USERPROFILE\.platformio\platforms"
-$env:PLATFORMIO_PACKAGES_DIR = "$env:USERPROFILE\.platformio\packages"
-& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e esp32_ledtile
+$env:PLATFORMIO_PACKAGES_DIR = "$env:LOCALAPPDATA\Temp\opencode\wled-ledtile-pio\packages"
+$pio = "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
+& $pio run -e esp32_huzzah32_ledtile --target upload
 ```
 
-These variables apply only to that terminal process. The standalone LedBoard
-demo pins its platform version so installing WLED's newer platform does not
-silently change its Arduino framework.
+Use the same environment in that PowerShell window for later `pio` commands;
+the variables apply only to that terminal process. A dedicated packages directory
+prevents WLED's Arduino Core 3 framework/toolchain from colliding with the
+standalone LedBoard demo's pinned framework packages.
 
 ## Wiring and configuration
 
-The default physical pins are:
+For the WROVER profile, the default physical pins are:
 
 | Signal | D1 | D2 | LAT | OE | A0 | A1 | CLK |
 |---|---|---|---|---|---|---|---|
 | GPIO | 26 | 18 | 19 | 21 | 22 | 23 | 25 |
 
-The WROVER-KIT's LCD must be disconnected. Use a separate, appropriately fused
+### Original Adafruit HUZZAH32 Feather pinout
+
+The HUZZAH32 override targets the original Feather with the ESP32-WROOM module,
+not the newer Feather ESP32 V2. Suggested panel mapping (signal order is
+D1, D2, LAT, OE, A0, A1, CLK):
+
+| Signal | D1 | D2 | LAT | OE | A0 | A1 | CLK |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ESP32 GPIO | 16 | 17 | 25 | 26 | 27 | 21 | 4 |
+| HUZZAH32 label | RX | TX | A1 | A0 | 27 | 21 | A5 |
+
+GPIO16/17 are the Feather's Serial1 RX/TX (not its USB serial pins). This map
+avoids the boot-strapping GPIOs, GPIO13's onboard red LED, GPIO32/33's optional
+32 kHz crystal function, USB/UART0, JTAG and common SPI pins. GPIO21 is
+available as a general-purpose pin, but is also commonly used for I2C SDA; leave
+WLED global I2C unconfigured or change the panel pin map. WLED's pin manager
+will reject an I2C/panel pin conflict. The build disables the default GPIO0
+button so the panel doesn't claim a boot-strapping pin. All panel inputs use
+3.3V logic; use a separate fused 5V supply with common ground as above.
+
+The HUZZAH32 has no PSRAM, so the environment does not define `BOARD_HAS_PSRAM`.
+Its Feather USB-UART is configured at 115200 baud for conservative upload
+reliability. Confirm GPIO labels against the exact board revision before wiring.
+Pinout source: [Adafruit HUZZAH32 Feather pinouts](https://learn.adafruit.com/adafruit-huzzah32-esp32-feather/pinouts).
+
+**WROVER-KIT only:** disconnect its onboard LCD. Use a separate, appropriately fused
 5V supply for the panel, with common ground. Verify signal-header orientation and
 pin numbering on the actual panel before wiring. Never power it through USB or
 the ESP32 dev board. **WLED automatic current limiting does not cover LedTile.**
